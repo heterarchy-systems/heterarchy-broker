@@ -3,7 +3,7 @@ use std::error::Error;
 use agent_broker_domain::commands::{
     BrokerCommand, ClaimTaskCommand, CompleteTaskCommand, EnsureConsumerGroupCommand,
     EnsureNamespaceCommand, JoinConsumerGroupCommand, LeaveConsumerGroupCommand,
-    PublishTaskCommand, ReapStaleMembersCommand,
+    PublishTaskCommand, ReapStaleMembersCommand, RenewTaskLeaseCommand,
 };
 use agent_broker_domain::results::BrokerMutationResult;
 use agent_broker_domain::{
@@ -195,5 +195,77 @@ fn stale_reap_requeues_member_owned_lease_for_surviving_member() -> Result<(), B
     };
     assert_eq!(reclaimed.task_id.as_ref(), Some(&task_id));
     assert_eq!(reclaimed.lease_epoch, Some(LeaseEpoch::new(2)));
+    Ok(())
+}
+
+#[test]
+fn unrelated_member_join_does_not_fence_existing_active_lease() -> Result<(), Box<dyn Error>> {
+    let mut machine = BrokerStateMachine::default();
+    let worker_a = ConsumerId::new("worker-a")?;
+    let worker_b = ConsumerId::new("worker-b")?;
+    let (group_id, lease_generation) = setup_group(&mut machine, &worker_a)?;
+    let task_id = publish(&mut machine)?;
+    let lease_id = LeaseId::new("lease-1")?;
+    let claimed = machine.apply(BrokerCommand::ClaimTask(ClaimTaskCommand {
+        group_id: group_id.clone(),
+        member_id: worker_a.clone(),
+        expected_term: Term::INITIAL,
+        expected_generation: lease_generation,
+        lease_id: lease_id.clone(),
+        now_ms: TimestampMs::new(2_000),
+        lease_duration_ms: 60_000,
+    }))?;
+    let BrokerMutationResult::TaskClaim(claim) = claimed.result else {
+        return Err("claim result must be TaskClaim".into());
+    };
+    let lease_epoch = claim.lease_epoch.ok_or("lease epoch must exist")?;
+
+    let joined = machine.apply(BrokerCommand::JoinConsumerGroup(JoinConsumerGroupCommand {
+        group_id: group_id.clone(),
+        member_id: worker_b,
+        capabilities: Capabilities::new(["code"])?,
+        now_ms: TimestampMs::new(2_100),
+        max_group_members: 256,
+    }))?;
+    let BrokerMutationResult::ConsumerGroup(group) = joined.result else {
+        return Err("join result must be ConsumerGroup".into());
+    };
+    assert!(group.generation.get() > lease_generation.get());
+
+    let renewed = machine.apply(BrokerCommand::RenewTaskLease(RenewTaskLeaseCommand {
+        task_id: task_id.clone(),
+        group_id: group_id.clone(),
+        member_id: worker_a.clone(),
+        expected_term: Term::INITIAL,
+        expected_generation: lease_generation,
+        expected_lease_epoch: lease_epoch,
+        lease_id: lease_id.clone(),
+        now_ms: TimestampMs::new(2_200),
+        lease_duration_ms: 60_000,
+    }))?;
+    let BrokerMutationResult::TaskLeaseRenewed(renewed) = renewed.result else {
+        return Err("renew result must be TaskLeaseRenewed".into());
+    };
+    assert_eq!(renewed.generation, lease_generation);
+    assert_eq!(renewed.lease_epoch, lease_epoch);
+
+    machine.apply(BrokerCommand::CompleteTask(CompleteTaskCommand {
+        task_id: task_id.clone(),
+        group_id,
+        member_id: worker_a,
+        expected_term: Term::INITIAL,
+        expected_generation: lease_generation,
+        expected_lease_epoch: lease_epoch,
+        lease_id,
+        result: TaskResult::new("done")?,
+        completed_at_ms: TimestampMs::new(2_300),
+    }))?;
+    assert_eq!(
+        machine
+            .state()
+            .task(&task_id)
+            .map(agent_broker_domain::Task::status),
+        Some(TaskStatus::Completed)
+    );
     Ok(())
 }

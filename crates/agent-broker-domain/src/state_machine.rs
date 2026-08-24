@@ -1057,11 +1057,7 @@ impl BrokerStateMachine {
         command: RenewTaskLeaseCommand,
     ) -> Result<TaskLeaseRenewedResult, StateMachineError> {
         self.require_term(command.expected_term)?;
-        let (_namespace_id, generation) = self.require_group_member(
-            &command.group_id,
-            &command.member_id,
-            command.expected_generation,
-        )?;
+        self.require_current_group_member(&command.group_id, &command.member_id)?;
         let expires_at_ms = Self::checked_deadline(command.now_ms, command.lease_duration_ms)?;
         let next_global_revision = self.state.revision.next()?;
         let (namespace_id, task_revision, lease_epoch) = {
@@ -1109,7 +1105,7 @@ impl BrokerStateMachine {
             lease_id: command.lease_id,
             lease_epoch,
             lease_expires_at_ms: expires_at_ms,
-            generation,
+            generation: command.expected_generation,
         })
     }
 
@@ -1118,11 +1114,7 @@ impl BrokerStateMachine {
         command: CompleteTaskCommand,
     ) -> Result<TaskCompletedResult, StateMachineError> {
         self.require_term(command.expected_term)?;
-        self.require_group_member(
-            &command.group_id,
-            &command.member_id,
-            command.expected_generation,
-        )?;
+        self.require_current_group_member(&command.group_id, &command.member_id)?;
         let next_global_revision = self.state.revision.next()?;
         let (outcome, task_revision, status) = {
             let task = self
@@ -1292,6 +1284,15 @@ impl BrokerStateMachine {
             expected_generation,
         )
         .map_err(StateMachineError::from)
+    }
+
+    fn require_current_group_member(
+        &self,
+        group_id: &ConsumerGroupId,
+        member_id: &ConsumerId,
+    ) -> Result<NamespaceId, StateMachineError> {
+        GroupCoordinator::require_current_member(&self.state.groups, group_id, member_id)
+            .map_err(StateMachineError::from)
     }
 
     fn checked_deadline(

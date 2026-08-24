@@ -114,6 +114,20 @@ impl GroupCoordinator {
         Ok((group.namespace_id().clone(), group.generation()))
     }
 
+    pub(crate) fn require_current_member(
+        groups: &BTreeMap<ConsumerGroupId, ConsumerGroup>,
+        group_id: &ConsumerGroupId,
+        member_id: &ConsumerId,
+    ) -> Result<NamespaceId, GroupCoordinatorError> {
+        let group = groups
+            .get(group_id)
+            .ok_or_else(|| GroupCoordinatorError::GroupNotFound(group_id.clone()))?;
+        if group.consumer(member_id).is_none() {
+            return Err(ConsumerGroupError::MemberNotFound(member_id.clone()).into());
+        }
+        Ok(group.namespace_id().clone())
+    }
+
     /// Return current logical Consumers in one Company whose advertised capabilities satisfy all
     /// required capabilities.
     ///
