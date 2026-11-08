@@ -1,9 +1,9 @@
 use agent_broker_application::{
-    BrokerError, BrokerErrorCode, BrokerErrorDisposition, SessionOwnerEpoch,
+    BrokerError, BrokerErrorCode, BrokerErrorDisposition, SessionOwnerEpoch, SessionOwnerInstanceId,
 };
 use agent_broker_domain::{
-    ConsumerGroupId, ConsumerId, Generation, LeaseEpoch, LeaseId, NamespaceId, Revision, TaskId,
-    TaskObjective, TaskStatus, Term, TimestampMs,
+    AuthorityFenceKey, AuthorityRevision, ConsumerGroupId, ConsumerId, Generation, LeaseEpoch,
+    LeaseId, NamespaceId, Revision, TaskId, TaskObjective, TaskStatus, Term, TimestampMs,
 };
 
 use crate::{DispatchResult, RequestId};
@@ -76,6 +76,23 @@ pub enum SuccessPayload {
     SessionOwnerAcquired {
         owner_epoch: SessionOwnerEpoch,
     },
+    SessionOwnerStatus {
+        owner_epoch: Option<SessionOwnerEpoch>,
+        owner_instance_id: Option<SessionOwnerInstanceId>,
+        applied_index: u64,
+    },
+    AuthorityRecorded {
+        term: Term,
+        revision: Revision,
+        key: AuthorityFenceKey,
+        recorded_revision: AuthorityRevision,
+    },
+    AuthorityReleased {
+        term: Term,
+        revision: Revision,
+        key: AuthorityFenceKey,
+        floor_revision: AuthorityRevision,
+    },
 }
 
 impl From<DispatchResult> for SuccessPayload {
@@ -146,6 +163,23 @@ impl From<DispatchResult> for SuccessPayload {
             DispatchResult::SessionOwnerAcquired(owner_epoch) => {
                 Self::SessionOwnerAcquired { owner_epoch }
             }
+            DispatchResult::SessionOwnerStatus(status) => Self::SessionOwnerStatus {
+                owner_epoch: status.owner.as_ref().map(|owner| owner.owner_epoch),
+                owner_instance_id: status.owner.and_then(|owner| owner.owner_instance_id),
+                applied_index: status.applied_index,
+            },
+            DispatchResult::AuthorityRecorded(result) => Self::AuthorityRecorded {
+                term: result.metadata.term,
+                revision: result.metadata.revision,
+                key: result.key,
+                recorded_revision: result.recorded_revision,
+            },
+            DispatchResult::AuthorityReleased(result) => Self::AuthorityReleased {
+                term: result.metadata.term,
+                revision: result.metadata.revision,
+                key: result.key,
+                floor_revision: result.floor_revision,
+            },
         }
     }
 }

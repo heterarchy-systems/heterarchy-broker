@@ -18,6 +18,23 @@ from agent_broker import (
 )
 
 
+def _agent_brokerd_binary(repo: Path) -> Path:
+    configured_binary = os.environ.get("AGENT_BROKERD_BIN")
+    if configured_binary:
+        binary = Path(configured_binary)
+        if not binary.is_absolute():
+            binary = repo / binary
+    else:
+        configured_target = os.environ.get("CARGO_TARGET_DIR")
+        target_dir = Path(configured_target) if configured_target else repo / "target"
+        if not target_dir.is_absolute():
+            target_dir = repo / target_dir
+        binary = target_dir / "debug" / "agentbrokerd"
+    if os.name == "nt" and binary.suffix.lower() != ".exe":
+        binary = binary.with_name(f"{binary.name}.exe")
+    return binary.resolve()
+
+
 @unittest.skipUnless(
     os.environ.get("AGENT_BROKER_RUN_CLUSTER_INTEGRATION") == "1",
     "set AGENT_BROKER_RUN_CLUSTER_INTEGRATION=1 with a real three-node cluster",
@@ -38,7 +55,8 @@ class RustClusterIntegrationTests(unittest.TestCase):
             cwd=repo,
             check=True,
         )
-        binary = repo / "target" / "debug" / "agentbrokerd"
+        binary = _agent_brokerd_binary(repo)
+        self.assertTrue(binary.is_file(), f"Rust Broker binary is missing: {binary}")
 
         reservations = [
             socket.socket(socket.AF_INET, socket.SOCK_STREAM) for _ in range(9)

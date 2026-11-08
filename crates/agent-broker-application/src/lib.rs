@@ -4,6 +4,7 @@
 mod command_identity;
 mod consensus;
 mod error;
+mod owner_status;
 mod service;
 
 pub use command_identity::{
@@ -12,6 +13,7 @@ pub use command_identity::{
 };
 pub use consensus::ConsensusAdapter;
 pub use error::{BrokerError, BrokerErrorCode, BrokerErrorDisposition};
+pub use owner_status::{CommandSessionOwnerRecord, CommandSessionOwnerStatus};
 pub use service::{
     BrokerApplicationService, BrokerHealth, ClaimTaskInput, CompleteTaskInput, RenewTaskLeaseInput,
 };

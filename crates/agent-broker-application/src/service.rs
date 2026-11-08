@@ -2,17 +2,20 @@ use agent_broker_domain::commands::{
     AdvanceTermCommand, BrokerCommand, ClaimTaskCommand, CompleteTaskCommand,
     EnsureConsumerGroupCommand, EnsureNamespaceCommand, HeartbeatCommand, JoinConsumerGroupCommand,
     LeaveConsumerGroupCommand, PruneCompletedTasksCommand, PublishTaskCommand,
-    ReapStaleMembersCommand, RenewTaskLeaseCommand,
+    ReapStaleMembersCommand, RecordAuthorityFenceCommand, ReleaseAuthorityFenceCommand,
+    RenewTaskLeaseCommand,
 };
 use agent_broker_domain::results::{
-    BrokerMutationResult, CompletedTasksPrunedResult, ConsumerGroupResult, HeartbeatResult,
-    NamespaceResult, StaleMembersReapedResult, TaskClaimResult, TaskCompletedResult,
-    TaskLeaseRenewedResult, TaskPublishedResult, TermAdvancedResult,
+    AuthorityRecordedResult, AuthorityReleasedResult, BrokerMutationResult,
+    CompletedTasksPrunedResult, ConsumerGroupResult, HeartbeatResult, NamespaceResult,
+    StaleMembersReapedResult, TaskClaimResult, TaskCompletedResult, TaskLeaseRenewedResult,
+    TaskPublishedResult, TermAdvancedResult,
 };
 use agent_broker_domain::{
-    BrokerCapacityPolicy, Capabilities, ConsumerGroupDirectory, ConsumerGroupId, ConsumerId,
-    Generation, LeaseDurationMs, LeaseEpoch, LeaseId, NamespaceId, PruneTaskLimit, ReapMemberLimit,
-    Revision, TaskId, TaskObjective, TaskResult, Term, TimestampMs,
+    AuthorityFenceKey, AuthorityId, AuthorityOwnerId, AuthorityRevision, BrokerCapacityPolicy,
+    Capabilities, ConsumerGroupDirectory, ConsumerGroupId, ConsumerId, Generation, LeaseDurationMs,
+    LeaseEpoch, LeaseId, NamespaceId, PruneTaskLimit, ReapMemberLimit, Revision, TaskId,
+    TaskObjective, TaskResult, Term, TimestampMs,
 };
 
 use crate::{
@@ -155,6 +158,18 @@ where
             expected_owner_epoch,
             owner_instance_id,
         )
+    }
+
+    /// Read the committed owner record of one command session without granting authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError`] when the consensus adapter cannot establish a linearizable read.
+    pub fn command_session_owner_status(
+        &mut self,
+        session_id: &CommandSessionId,
+    ) -> Result<crate::CommandSessionOwnerStatus, BrokerError> {
+        self.consensus.command_session_owner_status(session_id)
     }
 
     /// Identified variant of [`Self::ensure_namespace`].
@@ -626,6 +641,64 @@ where
             },
         ))?)
     }
+
+    /// Record or succeed one generic authority fence through the consensus authority boundary.
+    ///
+    /// `revision` is the caller's exact monotonic record value, not a compare-and-increment
+    /// counter. Re-recording the same key with the same authority at the exact same revision is an
+    /// idempotent replay; a different revision is a conflict; a different authority succeeds only
+    /// with a strictly greater revision.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError`] with `CONFLICT` for replay-binding violations, `STALE_FENCE` for
+    /// superseded records, `CAPACITY_EXCEEDED` when the bounded map is full, or when
+    /// consensus/persistence rejects the proposal.
+    pub fn authority_record(
+        &mut self,
+        key: AuthorityFenceKey,
+        revision: AuthorityRevision,
+        authority_id: AuthorityId,
+        owner_instance_id: AuthorityOwnerId,
+    ) -> Result<AuthorityRecordedResult, BrokerError> {
+        expect_authority_recorded(self.consensus.propose(BrokerCommand::RecordAuthorityFence(
+            RecordAuthorityFenceCommand {
+                key,
+                revision,
+                authority_id,
+                owner_instance_id,
+                max_authority_fences: self.capacity.max_authority_fences(),
+            },
+        ))?)
+    }
+
+    /// Release one generic authority fence through the consensus authority boundary.
+    ///
+    /// A successful release tombstones the key, clearing the owner and retaining the revision as an
+    /// ABA floor: later records at or below the floor are rejected with `STALE_FENCE`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError`] with `NOT_FOUND` for unknown keys, `STALE_FENCE` when the releasing
+    /// instance or expected revision does not match the live record, or when consensus/persistence
+    /// rejects the proposal.
+    pub fn authority_release(
+        &mut self,
+        key: AuthorityFenceKey,
+        expected_revision: AuthorityRevision,
+        owner_instance_id: AuthorityOwnerId,
+    ) -> Result<AuthorityReleasedResult, BrokerError> {
+        expect_authority_released(
+            self.consensus
+                .propose(BrokerCommand::ReleaseAuthorityFence(
+                    ReleaseAuthorityFenceCommand {
+                        key,
+                        expected_revision,
+                        owner_instance_id,
+                    },
+                ))?,
+        )
+    }
 }
 
 fn unexpected_result(expected: &'static str) -> BrokerError {
@@ -690,4 +763,16 @@ expect_result!(
     TermAdvanced,
     TermAdvancedResult,
     "TermAdvanced"
+);
+expect_result!(
+    expect_authority_recorded,
+    AuthorityRecorded,
+    AuthorityRecordedResult,
+    "AuthorityRecorded"
+);
+expect_result!(
+    expect_authority_released,
+    AuthorityReleased,
+    AuthorityReleasedResult,
+    "AuthorityReleased"
 );

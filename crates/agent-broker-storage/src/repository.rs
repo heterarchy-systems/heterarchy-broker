@@ -288,6 +288,7 @@ fn empty_checkpoint() -> BrokerCheckpoint {
         namespaces: Vec::new(),
         tasks: Vec::new(),
         groups: Vec::new(),
+        authority_fences: Vec::new(),
     }
 }
 

@@ -1,13 +1,15 @@
 use agent_broker_application::{
     BrokerApplicationService, BrokerError, BrokerErrorCode, BrokerHealth, ClaimTaskInput,
-    CommandIdentity, CommandSessionId, CompleteTaskInput, ConsensusAdapter, RenewTaskLeaseInput,
-    SessionOwnerEpoch, SessionOwnerInstanceId,
+    CommandIdentity, CommandSessionId, CommandSessionOwnerStatus, CompleteTaskInput,
+    ConsensusAdapter, RenewTaskLeaseInput, SessionOwnerEpoch, SessionOwnerInstanceId,
 };
 use agent_broker_domain::TimestampMs;
 use agent_broker_domain::results::{
-    ConsumerGroupResult, HeartbeatResult, NamespaceResult, TaskClaimResult, TaskCompletedResult,
-    TaskLeaseRenewedResult, TaskPublishedResult,
+    AuthorityRecordedResult, AuthorityReleasedResult, ConsumerGroupResult, HeartbeatResult,
+    NamespaceResult, TaskClaimResult, TaskCompletedResult, TaskLeaseRenewedResult,
+    TaskPublishedResult,
 };
+use agent_broker_domain::{AuthorityFenceKey, AuthorityId, AuthorityOwnerId, AuthorityRevision};
 
 use crate::BrokerRequest;
 
@@ -23,6 +25,9 @@ pub enum DispatchResult {
     TaskLeaseRenewed(TaskLeaseRenewedResult),
     TaskCompleted(TaskCompletedResult),
     SessionOwnerAcquired(SessionOwnerEpoch),
+    SessionOwnerStatus(CommandSessionOwnerStatus),
+    AuthorityRecorded(AuthorityRecordedResult),
+    AuthorityReleased(AuthorityReleasedResult),
 }
 
 /// Maps validated protocol requests into provider-neutral Broker application use cases.
@@ -70,6 +75,55 @@ where
         self.service
             .acquire_command_session_owner(session_id, expected_owner_epoch, owner_instance_id)
             .map(DispatchResult::SessionOwnerAcquired)
+    }
+
+    /// Read the committed owner record of one command session. Never mutates state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError`] when a linearizable read cannot be established.
+    pub fn dispatch_owner_status(
+        &mut self,
+        session_id: &CommandSessionId,
+    ) -> Result<DispatchResult, BrokerError> {
+        self.service
+            .command_session_owner_status(session_id)
+            .map(DispatchResult::SessionOwnerStatus)
+    }
+
+    /// Record or succeed one generic authority fence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError`] when the transition violates the deterministic fence rules
+    /// (`CONFLICT`/`STALE_FENCE`), capacity is exhausted, or consensus/persistence rejects it.
+    pub fn dispatch_authority_record(
+        &mut self,
+        key: AuthorityFenceKey,
+        revision: AuthorityRevision,
+        authority_id: AuthorityId,
+        owner_instance_id: AuthorityOwnerId,
+    ) -> Result<DispatchResult, BrokerError> {
+        self.service
+            .authority_record(key, revision, authority_id, owner_instance_id)
+            .map(DispatchResult::AuthorityRecorded)
+    }
+
+    /// Release one generic authority fence into an ABA-protecting tombstone.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError`] when the key is unknown, the owner/revision fence is stale, or
+    /// consensus/persistence rejects the release.
+    pub fn dispatch_authority_release(
+        &mut self,
+        key: AuthorityFenceKey,
+        expected_revision: AuthorityRevision,
+        owner_instance_id: AuthorityOwnerId,
+    ) -> Result<DispatchResult, BrokerError> {
+        self.service
+            .authority_release(key, expected_revision, owner_instance_id)
+            .map(DispatchResult::AuthorityReleased)
     }
 
     /// Dispatch one validated protocol request using the runtime-supplied observation time.

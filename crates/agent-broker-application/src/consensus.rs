@@ -3,8 +3,8 @@ use agent_broker_domain::results::BrokerMutationResult;
 use agent_broker_domain::{ConsumerGroupDirectory, Revision, Term};
 
 use crate::{
-    BrokerError, BrokerErrorCode, CommandIdentity, CommandSessionId, SessionOwnerEpoch,
-    SessionOwnerInstanceId,
+    BrokerError, BrokerErrorCode, CommandIdentity, CommandSessionId, CommandSessionOwnerStatus,
+    SessionOwnerEpoch, SessionOwnerInstanceId,
 };
 
 /// Provider-neutral proposal boundary between Broker application use cases and consensus/storage.
@@ -99,6 +99,25 @@ pub trait ConsensusAdapter {
         Err(BrokerError::new(
             BrokerErrorCode::InvalidRequest,
             "command-session owner acquisition is not supported by this adapter",
+        ))
+    }
+
+    /// Return the committed owner record of one command session through a linearizable read.
+    ///
+    /// The read never proposes a log entry, never changes an owner epoch and never grants
+    /// ownership. Replicated adapters must fail closed when read authority cannot be established.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError`] when the adapter does not support the read or cannot establish
+    /// authoritative read authority.
+    fn command_session_owner_status(
+        &mut self,
+        _session_id: &CommandSessionId,
+    ) -> Result<CommandSessionOwnerStatus, BrokerError> {
+        Err(BrokerError::new(
+            BrokerErrorCode::InvalidRequest,
+            "command-session owner status is not supported by this adapter",
         ))
     }
 }

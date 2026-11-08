@@ -9,11 +9,14 @@ use agent_broker_application::{
     BrokerErrorDisposition, CommandIdentity, CommandSessionId, SessionOwnerEpoch,
     SessionOwnerInstanceId,
 };
+use agent_broker_domain::{AuthorityFenceKey, AuthorityId, AuthorityOwnerId, AuthorityRevision};
 use agent_broker_protocol::{
-    BrokerRequest, OwnerAcquisitionRequestV3, OwnerIdentifiedBrokerRequestV3, RequestId,
-    ResponseDecodeError, SuccessPayload, decode_owner_acquisition_response_with_limit,
-    decode_owner_mutation_response_with_limit, encode_owner_acquisition_request_with_limit,
-    encode_owner_mutation_request_with_limit,
+    AuthorityRecordRequestV3, AuthorityReleaseRequestV3, BrokerRequest, OwnerAcquisitionRequestV3,
+    OwnerIdentifiedBrokerRequestV3, RequestId, ResponseDecodeError, SuccessPayload,
+    decode_authority_record_response_with_limit, decode_authority_release_response_with_limit,
+    decode_owner_acquisition_response_with_limit, decode_owner_mutation_response_with_limit,
+    encode_authority_record_request_with_limit, encode_authority_release_request_with_limit,
+    encode_owner_acquisition_request_with_limit, encode_owner_mutation_request_with_limit,
 };
 use serde_json::Value;
 
@@ -287,6 +290,120 @@ impl StaticClusterRouter {
                 self.config.max_response_frame_bytes,
             ) {
                 Ok(epoch) => Ok(epoch),
+                Err(ResponseDecodeError::Protocol(error)) => Err(ClientError::Protocol(error)),
+                Err(ResponseDecodeError::Broker(error)) => Err(ClientError::Broker(error)),
+            },
+        )
+    }
+
+    /// Record one generic authority fence on the single verified write-ready node.
+    ///
+    /// # Errors
+    /// Returns routing, transport, protocol, or Broker errors after bounded exact-frame attempts.
+    pub fn authority_record(
+        &mut self,
+        key: AuthorityFenceKey,
+        revision: AuthorityRevision,
+        authority_id: AuthorityId,
+        owner_instance_id: AuthorityOwnerId,
+    ) -> Result<AuthorityRevision, StaticClusterRoutingError> {
+        let request_id = self.next_request_id()?;
+        self.authority_record_with_request_id(
+            &request_id,
+            key,
+            revision,
+            authority_id,
+            owner_instance_id,
+        )
+    }
+
+    /// Record one generic authority fence with a caller-supplied request identity.
+    ///
+    /// # Errors
+    /// Returns routing, transport, protocol, or Broker errors after bounded exact-frame attempts.
+    pub fn authority_record_with_request_id(
+        &self,
+        request_id: &RequestId,
+        key: AuthorityFenceKey,
+        revision: AuthorityRevision,
+        authority_id: AuthorityId,
+        owner_instance_id: AuthorityOwnerId,
+    ) -> Result<AuthorityRevision, StaticClusterRoutingError> {
+        let request = AuthorityRecordRequestV3::new(
+            request_id.clone(),
+            key,
+            revision,
+            authority_id,
+            owner_instance_id,
+        );
+        let frame = encode_authority_record_request_with_limit(
+            &request,
+            self.config.max_response_frame_bytes,
+        )
+        .map_err(ClientError::Protocol)?;
+        self.route_exact_frame(
+            &frame,
+            |response| match decode_authority_record_response_with_limit(
+                response,
+                request_id,
+                self.config.max_response_frame_bytes,
+            ) {
+                Ok(recorded_revision) => Ok(recorded_revision),
+                Err(ResponseDecodeError::Protocol(error)) => Err(ClientError::Protocol(error)),
+                Err(ResponseDecodeError::Broker(error)) => Err(ClientError::Broker(error)),
+            },
+        )
+    }
+
+    /// Release one generic authority fence on the single verified write-ready node.
+    ///
+    /// # Errors
+    /// Returns routing, transport, protocol, or Broker errors after bounded exact-frame attempts.
+    pub fn authority_release(
+        &mut self,
+        key: AuthorityFenceKey,
+        expected_revision: AuthorityRevision,
+        owner_instance_id: AuthorityOwnerId,
+    ) -> Result<AuthorityRevision, StaticClusterRoutingError> {
+        let request_id = self.next_request_id()?;
+        self.authority_release_with_request_id(
+            &request_id,
+            key,
+            expected_revision,
+            owner_instance_id,
+        )
+    }
+
+    /// Release one generic authority fence with a caller-supplied request identity.
+    ///
+    /// # Errors
+    /// Returns routing, transport, protocol, or Broker errors after bounded exact-frame attempts.
+    pub fn authority_release_with_request_id(
+        &self,
+        request_id: &RequestId,
+        key: AuthorityFenceKey,
+        expected_revision: AuthorityRevision,
+        owner_instance_id: AuthorityOwnerId,
+    ) -> Result<AuthorityRevision, StaticClusterRoutingError> {
+        let request = AuthorityReleaseRequestV3::new(
+            request_id.clone(),
+            key,
+            expected_revision,
+            owner_instance_id,
+        );
+        let frame = encode_authority_release_request_with_limit(
+            &request,
+            self.config.max_response_frame_bytes,
+        )
+        .map_err(ClientError::Protocol)?;
+        self.route_exact_frame(
+            &frame,
+            |response| match decode_authority_release_response_with_limit(
+                response,
+                request_id,
+                self.config.max_response_frame_bytes,
+            ) {
+                Ok(floor_revision) => Ok(floor_revision),
                 Err(ResponseDecodeError::Protocol(error)) => Err(ClientError::Protocol(error)),
                 Err(ResponseDecodeError::Broker(error)) => Err(ClientError::Broker(error)),
             },

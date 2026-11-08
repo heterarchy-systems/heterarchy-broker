@@ -393,7 +393,13 @@ fn wait_for_child_ready(
 ) -> Result<(), Box<dyn Error>> {
     let deadline = Instant::now() + timeout;
     loop {
-        if ready_path.is_file() {
+        // `File::create` materializes an empty marker before the child writes
+        // the term/revision payload; under parallel full-workspace runs the
+        // parent can observe that empty window, so readiness requires actual
+        // marker content, not mere existence.
+        if let Ok(ready) = std::fs::read_to_string(ready_path)
+            && !ready.trim().is_empty()
+        {
             return Ok(());
         }
         if let Some(status) = child.try_wait()? {
@@ -486,4 +492,98 @@ fn lifecycle_commands(term: Term) -> Result<Vec<BrokerCommand>, Box<dyn Error>> 
             completed_at_ms: TimestampMs::new(1_400),
         }),
     ])
+}
+
+#[test]
+fn one_node_raft_authority_fences_match_standalone_and_survive_restart()
+-> Result<(), Box<dyn Error>> {
+    use agent_broker_application::BrokerErrorCode;
+    use agent_broker_domain::commands::{
+        RecordAuthorityFenceCommand, ReleaseAuthorityFenceCommand,
+    };
+    use agent_broker_domain::results::BrokerMutationResult;
+    use agent_broker_domain::{
+        AuthorityFenceKey, AuthorityId, AuthorityOwnerId, AuthorityRevision,
+    };
+
+    let fence_key = AuthorityFenceKey::new("leader:shard-raft")?;
+    let record =
+        |revision: u64, authority: &str, owner: &str| -> Result<BrokerCommand, Box<dyn Error>> {
+            Ok(BrokerCommand::RecordAuthorityFence(
+                RecordAuthorityFenceCommand {
+                    key: fence_key.clone(),
+                    revision: AuthorityRevision::new(revision)?,
+                    authority_id: AuthorityId::new(authority)?,
+                    owner_instance_id: AuthorityOwnerId::new(owner)?,
+                    max_authority_fences: 4_096,
+                },
+            ))
+        };
+
+    let directory = tempdir()?;
+    let raft_path = directory.path().join("one-node-authority.redb");
+    let config = OneNodeRaftConfig::new(&raft_path).with_snapshot_log_interval(4)?;
+    let mut raft = OneNodeRaftConsensusAdapter::open(config.clone())?;
+    let mut standalone = StandaloneConsensusAdapter::new(MemoryRepository::default())?;
+    synchronize_standalone_term(&mut standalone, raft.term())?;
+
+    // Deterministic parity between the one-node Raft path and the standalone path.
+    for command in [
+        record(5, "authority-a", "process-a")?,
+        record(5, "authority-a", "process-a")?, // idempotent replay
+    ] {
+        let standalone_result = standalone.propose(command.clone())?;
+        let raft_result = raft.propose(command)?;
+        assert_eq!(raft_result, standalone_result);
+        assert_eq!(raft.revision(), standalone.revision());
+    }
+
+    // Same authority at a different revision is a conflict on both paths. Dispositions differ by
+    // durability contract (Raft errors are committed outcomes; standalone stays unknown), so only
+    // the stable code and revision progress are compared.
+    let raft_conflict = raft.propose(record(6, "authority-a", "process-a")?);
+    let standalone_conflict = standalone.propose(record(6, "authority-a", "process-a")?);
+    let Err(conflict_error) = &raft_conflict else {
+        return Err("same-authority revision change must fail".into());
+    };
+    assert_eq!(conflict_error.code(), BrokerErrorCode::Conflict);
+    let Err(standalone_conflict_error) = &standalone_conflict else {
+        return Err("standalone same-authority revision change must fail".into());
+    };
+    assert_eq!(standalone_conflict_error.code(), BrokerErrorCode::Conflict);
+    assert_eq!(raft.revision(), standalone.revision());
+
+    // Release through both paths tombstones the key at the recorded revision.
+    let release_command = BrokerCommand::ReleaseAuthorityFence(ReleaseAuthorityFenceCommand {
+        key: fence_key.clone(),
+        expected_revision: AuthorityRevision::new(5)?,
+        owner_instance_id: AuthorityOwnerId::new("process-a")?,
+    });
+    let standalone_release = standalone.propose(release_command.clone())?;
+    let raft_release = raft.propose(release_command)?;
+    let BrokerMutationResult::AuthorityReleased(released) = &raft_release else {
+        return Err("expected AuthorityReleased result".into());
+    };
+    assert_eq!(released.floor_revision, AuthorityRevision::new(5)?);
+    assert_eq!(raft_release, standalone_release);
+    assert_eq!(raft.revision(), standalone.revision());
+
+    let _ = raft.trigger_snapshot()?;
+    raft.shutdown()?;
+
+    // The tombstone floor survives a snapshot restart and keeps fencing ABA reuse.
+    let mut restarted = OneNodeRaftConsensusAdapter::open(config)?;
+    let stale = restarted.propose(record(5, "authority-a", "process-a")?);
+    let Err(stale_error) = stale else {
+        return Err("released floor must fence equal revision after restart".into());
+    };
+    assert_eq!(stale_error.code(), BrokerErrorCode::StaleFence);
+
+    let succession = restarted.propose(record(6, "authority-b", "process-b")?)?;
+    let BrokerMutationResult::AuthorityRecorded(recorded) = succession else {
+        return Err("expected AuthorityRecorded result".into());
+    };
+    assert_eq!(recorded.recorded_revision, AuthorityRevision::new(6)?);
+    restarted.shutdown()?;
+    Ok(())
 }

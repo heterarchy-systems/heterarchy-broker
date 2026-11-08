@@ -116,6 +116,24 @@ impl StateOwnerHandle {
                                         request.expected_owner_epoch(),
                                         request.owner_instance_id().clone(),
                                     ),
+                                    agent_broker_protocol::BrokerRequestV3::OwnerStatus(
+                                        request,
+                                    ) => dispatcher.dispatch_owner_status(request.session_id()),
+                                    agent_broker_protocol::BrokerRequestV3::AuthorityRecord(
+                                        request,
+                                    ) => dispatcher.dispatch_authority_record(
+                                        request.key().clone(),
+                                        request.revision(),
+                                        request.authority_id().clone(),
+                                        request.owner_instance_id().clone(),
+                                    ),
+                                    agent_broker_protocol::BrokerRequestV3::AuthorityRelease(
+                                        request,
+                                    ) => dispatcher.dispatch_authority_release(
+                                        request.key().clone(),
+                                        request.expected_revision(),
+                                        request.owner_instance_id().clone(),
+                                    ),
                                     agent_broker_protocol::BrokerRequestV3::Mutation(request) => {
                                         dispatcher.dispatch_identified(
                                             request.identity().clone(),

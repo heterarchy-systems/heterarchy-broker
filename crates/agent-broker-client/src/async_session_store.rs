@@ -116,6 +116,33 @@ impl AsyncDurableClientSessionStore {
             .await
     }
 
+    /// Durably reserve an owner acquisition expecting a Broker-observed epoch.
+    ///
+    /// # Errors
+    /// Returns durable store errors or a blocking-task failure.
+    pub async fn begin_owner_acquisition_at_observed_epoch(
+        &self,
+        owner_instance_id: SessionOwnerInstanceId,
+        observed_owner_epoch: SessionOwnerEpoch,
+    ) -> Result<PendingOwnerAcquisition, ClientSessionStoreError> {
+        self.with_store(move |store| {
+            store.begin_owner_acquisition_at_observed_epoch(owner_instance_id, observed_owner_epoch)
+        })
+        .await
+    }
+
+    /// Durably discard a definitively rejected pending owner acquisition.
+    ///
+    /// # Errors
+    /// Returns durable store errors or a blocking-task failure.
+    pub async fn release_rejected_owner_acquisition(
+        &self,
+        pending: PendingOwnerAcquisition,
+    ) -> Result<(), ClientSessionStoreError> {
+        self.with_store(move |store| store.release_rejected_owner_acquisition(&pending))
+            .await
+    }
+
     /// Durably confirm a Broker-returned owner epoch.
     ///
     /// # Errors

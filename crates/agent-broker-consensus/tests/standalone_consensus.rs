@@ -210,3 +210,93 @@ fn standalone_group_directory_is_side_effect_free_and_current() -> Result<(), Bo
     assert_eq!(group.consumer_count(), 1);
     Ok(())
 }
+
+#[test]
+fn journaled_authority_fences_survive_restart_and_keep_their_floor() -> Result<(), Box<dyn Error>> {
+    use agent_broker_domain::commands::{
+        RecordAuthorityFenceCommand, ReleaseAuthorityFenceCommand,
+    };
+    use agent_broker_domain::results::BrokerMutationResult;
+    use agent_broker_domain::{
+        AuthorityFence, AuthorityFenceKey, AuthorityId, AuthorityOwnerId, AuthorityRevision,
+    };
+
+    let fence_key = AuthorityFenceKey::new("leader:shard-a")?;
+    let record =
+        |revision: u64, authority: &str, owner: &str| -> Result<BrokerCommand, Box<dyn Error>> {
+            Ok(BrokerCommand::RecordAuthorityFence(
+                RecordAuthorityFenceCommand {
+                    key: fence_key.clone(),
+                    revision: AuthorityRevision::new(revision)?,
+                    authority_id: AuthorityId::new(authority)?,
+                    owner_instance_id: AuthorityOwnerId::new(owner)?,
+                    max_authority_fences: 4_096,
+                },
+            ))
+        };
+
+    let directory = tempdir()?;
+    let snapshot_path = directory.path().join("authority-state.json");
+    let policy = JournalCompactionPolicy::new(10_000, 64 * 1024 * 1024)?;
+    let repository = JournaledBrokerStateRepository::new(snapshot_path.clone(), None, policy);
+    let mut adapter = StandaloneConsensusAdapter::new(repository)?;
+    adapter.propose(record(5, "authority-a", "process-a")?)?;
+    let revision_after_record = adapter.revision();
+    adapter.propose(BrokerCommand::ReleaseAuthorityFence(
+        ReleaseAuthorityFenceCommand {
+            key: fence_key.clone(),
+            expected_revision: AuthorityRevision::new(5)?,
+            owner_instance_id: AuthorityOwnerId::new("process-a")?,
+        },
+    ))?;
+    let revision_after_release = adapter.revision();
+    assert_eq!(
+        revision_after_release.get(),
+        revision_after_record.get() + 1
+    );
+    drop(adapter);
+
+    // Restart from the same journal: the tombstone floor survives the process.
+    let repository = JournaledBrokerStateRepository::new(snapshot_path.clone(), None, policy);
+    let mut restarted = StandaloneConsensusAdapter::new(repository)?;
+    assert_eq!(restarted.revision(), revision_after_release);
+    assert_eq!(
+        restarted
+            .state_machine()
+            .state()
+            .authority_fence(&fence_key),
+        Some(&AuthorityFence::Released {
+            revision: AuthorityRevision::new(5)?,
+        })
+    );
+
+    // ABA protection survives the restart: revision <= floor stays fenced.
+    let stale = restarted.propose(record(5, "authority-a", "process-a")?);
+    let Err(error) = stale else {
+        return Err("released floor must fence an equal revision after restart".into());
+    };
+    assert_eq!(error.code(), BrokerErrorCode::StaleFence);
+
+    // Succession above the floor is still accepted and persisted.
+    let succession = restarted.propose(record(6, "authority-b", "process-b")?)?;
+    let BrokerMutationResult::AuthorityRecorded(recorded) = succession else {
+        return Err("expected AuthorityRecorded result".into());
+    };
+    assert_eq!(recorded.recorded_revision, AuthorityRevision::new(6)?);
+    drop(restarted);
+
+    let repository = JournaledBrokerStateRepository::new(snapshot_path.clone(), None, policy);
+    let final_adapter = StandaloneConsensusAdapter::new(repository)?;
+    assert_eq!(
+        final_adapter
+            .state_machine()
+            .state()
+            .authority_fence(&fence_key),
+        Some(&AuthorityFence::Record {
+            revision: AuthorityRevision::new(6)?,
+            authority_id: AuthorityId::new("authority-b")?,
+            owner_instance_id: AuthorityOwnerId::new("process-b")?,
+        })
+    );
+    Ok(())
+}

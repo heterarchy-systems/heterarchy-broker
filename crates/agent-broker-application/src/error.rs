@@ -1,7 +1,9 @@
 use std::error::Error;
 use std::fmt;
 
-use agent_broker_domain::{ConsumerGroupError, StateMachineError, TaskTransitionError};
+use agent_broker_domain::{
+    AuthorityFenceError, ConsumerGroupError, StateMachineError, TaskTransitionError,
+};
 
 /// Stable protocol-facing Broker error codes preserved from the Python reference implementation.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
@@ -137,9 +139,21 @@ fn state_machine_error_code(error: &StateMachineError) -> BrokerErrorCode {
         }
         StateMachineError::ConsumerGroupTransition(error) => consumer_group_error_code(error),
         StateMachineError::TaskTransition(error) => task_transition_error_code(error),
+        StateMachineError::AuthorityFence(error) => authority_fence_error_code(error),
         StateMachineError::TaskCountUnderflow(_) | StateMachineError::FencingValue(_) => {
             BrokerErrorCode::InternalError
         }
+    }
+}
+
+fn authority_fence_error_code(error: &AuthorityFenceError) -> BrokerErrorCode {
+    match error {
+        AuthorityFenceError::ReplayConflict { .. } => BrokerErrorCode::Conflict,
+        AuthorityFenceError::Superseded { .. } | AuthorityFenceError::NotOwner { .. } => {
+            BrokerErrorCode::StaleFence
+        }
+        AuthorityFenceError::NotFound(_) => BrokerErrorCode::NotFound,
+        AuthorityFenceError::CapacityExceeded { .. } => BrokerErrorCode::CapacityExceeded,
     }
 }
 

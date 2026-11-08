@@ -106,6 +106,7 @@ pub struct BrokerCapacityPolicy {
     tasks_per_namespace: usize,
     groups_per_namespace: usize,
     members_per_group: usize,
+    authority_fences: usize,
 }
 
 impl Default for BrokerCapacityPolicy {
@@ -115,12 +116,16 @@ impl Default for BrokerCapacityPolicy {
             tasks_per_namespace: 4_096,
             groups_per_namespace: 64,
             members_per_group: 256,
+            authority_fences: crate::authority::DEFAULT_MAX_AUTHORITY_FENCES,
         }
     }
 }
 
 impl BrokerCapacityPolicy {
     /// Construct a custom validated hot-state capacity policy.
+    ///
+    /// The generic authority fence capacity uses the stable default bound; it is not part of the
+    /// historical Python-reference constructor surface.
     ///
     /// # Errors
     ///
@@ -142,6 +147,7 @@ impl BrokerCapacityPolicy {
                 "max_groups_per_namespace",
             )?,
             members_per_group: positive_capacity(max_members_per_group, "max_members_per_group")?,
+            authority_fences: crate::authority::DEFAULT_MAX_AUTHORITY_FENCES,
         })
     }
 
@@ -163,6 +169,12 @@ impl BrokerCapacityPolicy {
     #[must_use]
     pub const fn max_members_per_group(self) -> usize {
         self.members_per_group
+    }
+
+    /// Return the bound on retained generic authority fence records, including tombstones.
+    #[must_use]
+    pub const fn max_authority_fences(self) -> usize {
+        self.authority_fences
     }
 }
 

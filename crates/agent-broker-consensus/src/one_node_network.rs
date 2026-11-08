@@ -39,6 +39,7 @@ pub(crate) struct OneNodeRaftNetwork {
 impl RaftNetworkFactory<AgentBrokerRaftTypeConfig> for OneNodeRaftNetworkFactory {
     type Network = OneNodeRaftNetwork;
 
+    #[allow(clippy::unused_async_trait_impl)]
     async fn new_client(
         &mut self,
         target: AgentBrokerRaftNodeId,
@@ -52,6 +53,7 @@ impl RaftNetworkFactory<AgentBrokerRaftTypeConfig> for OneNodeRaftNetworkFactory
 }
 
 impl RaftNetwork<AgentBrokerRaftTypeConfig> for OneNodeRaftNetwork {
+    #[allow(clippy::unused_async_trait_impl)]
     async fn append_entries(
         &mut self,
         _rpc: AppendEntriesRequest<AgentBrokerRaftTypeConfig>,
@@ -64,6 +66,7 @@ impl RaftNetwork<AgentBrokerRaftTypeConfig> for OneNodeRaftNetwork {
         Err(unreachable(self.target).into())
     }
 
+    #[allow(clippy::unused_async_trait_impl)]
     async fn vote(
         &mut self,
         _rpc: VoteRequest<AgentBrokerRaftNodeId>,
@@ -76,6 +79,7 @@ impl RaftNetwork<AgentBrokerRaftTypeConfig> for OneNodeRaftNetwork {
         Err(unreachable(self.target).into())
     }
 
+    #[allow(clippy::unused_async_trait_impl)]
     async fn full_snapshot(
         &mut self,
         _vote: Vote<AgentBrokerRaftNodeId>,

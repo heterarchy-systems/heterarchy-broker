@@ -6,12 +6,14 @@ use agent_broker_domain::commands::{
 };
 use agent_broker_domain::results::BrokerMutationResult;
 use agent_broker_domain::{
-    BrokerCheckpoint, BrokerStateMachine, Capabilities, ConsumerGroupId, ConsumerId, Generation,
-    LeaseId, NamespaceId, Revision, TaskId, TaskObjective, TaskResult, Term, TimestampMs,
+    AuthorityFence, AuthorityFenceCheckpoint, AuthorityFenceKey, AuthorityId, AuthorityOwnerId,
+    AuthorityRevision, BrokerCheckpoint, BrokerStateMachine, Capabilities, ConsumerGroupId,
+    ConsumerId, Generation, LeaseId, NamespaceId, Revision, TaskId, TaskObjective, TaskResult,
+    Term, TimestampMs,
 };
 use agent_broker_storage::{
-    StorageError, apply_journal_mutation, decode_journal_mutation, decode_snapshot,
-    encode_journal_mutation, encode_snapshot,
+    JournalMutation, StorageError, apply_journal_mutation, decode_journal_mutation,
+    decode_snapshot, encode_journal_mutation, encode_snapshot,
 };
 use serde_json::Value;
 
@@ -201,7 +203,78 @@ fn empty_checkpoint() -> BrokerCheckpoint {
         namespaces: Vec::new(),
         tasks: Vec::new(),
         groups: Vec::new(),
+        authority_fences: Vec::new(),
     }
+}
+
+fn authority_record(
+    revision: u64,
+    authority_id: &str,
+    owner_instance_id: &str,
+) -> Result<AuthorityFence, Box<dyn Error>> {
+    Ok(AuthorityFence::Record {
+        revision: AuthorityRevision::new(revision)?,
+        authority_id: AuthorityId::new(authority_id)?,
+        owner_instance_id: AuthorityOwnerId::new(owner_instance_id)?,
+    })
+}
+
+fn authority_tombstone(revision: u64) -> Result<AuthorityFence, Box<dyn Error>> {
+    Ok(AuthorityFence::Released {
+        revision: AuthorityRevision::new(revision)?,
+    })
+}
+
+fn authority_checkpoint(
+    key: &str,
+    fence: AuthorityFence,
+) -> Result<AuthorityFenceCheckpoint, Box<dyn Error>> {
+    Ok(AuthorityFenceCheckpoint {
+        key: AuthorityFenceKey::new(key)?,
+        fence,
+    })
+}
+
+fn authority_mutation(
+    revision: Revision,
+    authority_fences: Vec<AuthorityFenceCheckpoint>,
+) -> JournalMutation {
+    JournalMutation {
+        term: Term::INITIAL,
+        revision,
+        namespaces: Vec::new(),
+        tasks: Vec::new(),
+        deleted_tasks: Vec::new(),
+        groups: Vec::new(),
+        authority_fences,
+    }
+}
+
+fn assert_rejected_authority_transition(
+    checkpoint: &BrokerCheckpoint,
+    authority_fences: Vec<AuthorityFenceCheckpoint>,
+    label: &str,
+) {
+    let mut attempted = checkpoint.clone();
+    let before = attempted.clone();
+    let next_revision = Revision::new(before.revision.get() + 1);
+
+    assert!(
+        apply_journal_mutation(
+            &mut attempted,
+            authority_mutation(next_revision, authority_fences)
+        )
+        .is_err(),
+        "{label}: invalid authority transition must be rejected"
+    );
+    assert_eq!(
+        attempted.revision, before.revision,
+        "{label}: rejected transition advanced the global revision"
+    );
+    assert_eq!(
+        attempted, before,
+        "{label}: rejected transition changed the checkpoint"
+    );
 }
 
 fn journal_frames() -> impl Iterator<Item = &'static [u8]> {
@@ -255,6 +328,122 @@ fn replay_ignores_stale_records_and_rejects_revision_gaps_transactionally()
         Err(StorageError::RevisionGap { .. })
     ));
     assert_eq!(gap_checkpoint, before_gap);
+    Ok(())
+}
+
+#[test]
+fn public_journal_replay_accepts_domain_legal_authority_fence_transitions()
+-> Result<(), Box<dyn Error>> {
+    let key = "journal-authority";
+    let original = authority_checkpoint(key, authority_record(7, "authority-a", "owner-a")?)?;
+    let mut checkpoint = empty_checkpoint();
+
+    assert!(apply_journal_mutation(
+        &mut checkpoint,
+        authority_mutation(Revision::new(1), vec![original.clone()])
+    )?);
+    assert_eq!(checkpoint.authority_fences, vec![original.clone()]);
+
+    assert!(apply_journal_mutation(
+        &mut checkpoint,
+        authority_mutation(Revision::new(2), vec![original.clone()])
+    )?);
+    assert_eq!(checkpoint.authority_fences, vec![original]);
+
+    let released = authority_checkpoint(key, authority_tombstone(7)?)?;
+    assert!(apply_journal_mutation(
+        &mut checkpoint,
+        authority_mutation(Revision::new(3), vec![released.clone()])
+    )?);
+    assert!(apply_journal_mutation(
+        &mut checkpoint,
+        authority_mutation(Revision::new(4), vec![released])
+    )?);
+
+    let successor = authority_checkpoint(key, authority_record(8, "authority-b", "owner-b")?)?;
+    assert!(apply_journal_mutation(
+        &mut checkpoint,
+        authority_mutation(Revision::new(5), vec![successor.clone()])
+    )?);
+    assert_eq!(checkpoint.authority_fences, vec![successor]);
+    assert_eq!(checkpoint.revision, Revision::new(5));
+    Ok(())
+}
+
+#[test]
+fn public_journal_replay_rejects_illegal_authority_fence_transitions_transactionally()
+-> Result<(), Box<dyn Error>> {
+    let key = "journal-authority";
+    let original = authority_checkpoint(key, authority_record(7, "authority-a", "owner-a")?)?;
+    let mut live_checkpoint = empty_checkpoint();
+    assert!(apply_journal_mutation(
+        &mut live_checkpoint,
+        authority_mutation(Revision::new(1), vec![original])
+    )?);
+
+    let invalid_live_records = [
+        (
+            "same revision with another authority",
+            authority_checkpoint(key, authority_record(7, "authority-b", "owner-b")?)?,
+        ),
+        (
+            "same authority with a higher revision",
+            authority_checkpoint(key, authority_record(8, "authority-a", "owner-a")?)?,
+        ),
+        (
+            "same authority and revision with another owner",
+            authority_checkpoint(key, authority_record(7, "authority-a", "owner-b")?)?,
+        ),
+        (
+            "lower record revision",
+            authority_checkpoint(key, authority_record(6, "authority-b", "owner-b")?)?,
+        ),
+        (
+            "release at a different revision",
+            authority_checkpoint(key, authority_tombstone(8)?)?,
+        ),
+    ];
+    for (label, incoming) in invalid_live_records {
+        assert_rejected_authority_transition(&live_checkpoint, vec![incoming], label);
+    }
+
+    assert_rejected_authority_transition(
+        &empty_checkpoint(),
+        vec![authority_checkpoint(key, authority_tombstone(1)?)?],
+        "absent key cannot begin as released",
+    );
+
+    let duplicate = authority_checkpoint(key, authority_record(7, "authority-a", "owner-a")?)?;
+    assert_rejected_authority_transition(
+        &empty_checkpoint(),
+        vec![duplicate.clone(), duplicate],
+        "duplicate key in one journal mutation",
+    );
+
+    let mut released_checkpoint = live_checkpoint;
+    assert!(apply_journal_mutation(
+        &mut released_checkpoint,
+        authority_mutation(
+            Revision::new(2),
+            vec![authority_checkpoint(key, authority_tombstone(7)?)?]
+        )
+    )?);
+    for (label, incoming) in [
+        (
+            "same-floor resurrection",
+            authority_checkpoint(key, authority_record(7, "authority-b", "owner-b")?)?,
+        ),
+        (
+            "lower-floor resurrection",
+            authority_checkpoint(key, authority_record(6, "authority-b", "owner-b")?)?,
+        ),
+        (
+            "tombstone floor change",
+            authority_checkpoint(key, authority_tombstone(8)?)?,
+        ),
+    ] {
+        assert_rejected_authority_transition(&released_checkpoint, vec![incoming], label);
+    }
     Ok(())
 }
 

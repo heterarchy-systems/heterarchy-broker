@@ -8,8 +8,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use agent_broker_application::{
-    BrokerError, BrokerErrorCode, CommandIdentity, CommandSessionId, ConsensusAdapter,
-    SessionOwnerEpoch, SessionOwnerInstanceId,
+    BrokerError, BrokerErrorCode, CommandIdentity, CommandSessionId, CommandSessionOwnerStatus,
+    ConsensusAdapter, SessionOwnerEpoch, SessionOwnerInstanceId,
 };
 use agent_broker_domain::commands::{AdvanceTermCommand, BrokerCommand};
 use agent_broker_domain::results::BrokerMutationResult;
@@ -626,6 +626,20 @@ impl ConsensusAdapter for ClusterRaftConsensusAdapter {
         self.request(|reply| ControllerRequest::GroupDirectory { deadline, reply })?
     }
 
+    fn command_session_owner_status(
+        &mut self,
+        session_id: &CommandSessionId,
+    ) -> Result<CommandSessionOwnerStatus, BrokerError> {
+        self.ensure_available()?;
+        let deadline = Instant::now() + DEFAULT_READINESS_PROBE_TIMEOUT;
+        let session_id = session_id.clone();
+        self.request(|reply| ControllerRequest::CommandSessionOwnerStatus {
+            session_id,
+            deadline,
+            reply,
+        })?
+    }
+
     fn maintenance_authority(&mut self) -> Result<bool, BrokerError> {
         let progress = self.progress()?;
         Ok(progress.current_leader == Some(self.node_id))
@@ -751,6 +765,11 @@ enum ControllerRequest {
         deadline: Instant,
         reply: SyncSender<Result<ConsumerGroupDirectory, BrokerError>>,
     },
+    CommandSessionOwnerStatus {
+        session_id: CommandSessionId,
+        deadline: Instant,
+        reply: SyncSender<Result<CommandSessionOwnerStatus, BrokerError>>,
+    },
     Shutdown {
         reply: SyncSender<Result<(), BrokerError>>,
     },
@@ -770,6 +789,8 @@ fn run_controller(
     startup_sender: &SyncSender<Result<ClusterRaftProgress, BrokerError>>,
     observation: Arc<RaftBrokerObservation>,
 ) {
+    let mut diagnostics = crate::cluster_diagnostics::Diagnostics::new(config.node_id());
+    let mut output = crate::cluster_diagnostics::enqueue;
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_time()
         .thread_name(format!("agent-broker-cluster-runtime-{}", config.node_id()))
@@ -777,6 +798,7 @@ fn run_controller(
     {
         Ok(runtime) => runtime,
         Err(error) => {
+            diagnostics.startup_failure(BrokerErrorCode::InternalError, &mut output);
             let _send_result = startup_sender.send(Err(BrokerError::new(
                 BrokerErrorCode::InternalError,
                 format!("failed to build cluster Raft Tokio runtime: {error}"),
@@ -787,13 +809,15 @@ fn run_controller(
     let mut running = match runtime.block_on(RunningClusterRaft::open(config, observation)) {
         Ok(running) => running,
         Err(error) => {
+            diagnostics.startup_failure(error.code(), &mut output);
             let _send_result = startup_sender.send(Err(error));
             return;
         }
     };
     let startup_progress = runtime.block_on(running.progress());
+    diagnostics.startup(&startup_progress, &mut output);
     if startup_sender.send(startup_progress).is_err() {
-        let _shutdown_result = running.stop(&runtime);
+        diagnostics.shutdown(&running.stop(&runtime), &mut output);
         return;
     }
     while let Ok(request) = receiver.recv() {
@@ -825,31 +849,45 @@ fn run_controller(
             }
             ControllerRequest::Progress { reply } => {
                 let result = runtime.block_on(running.progress());
+                if let Ok(progress) = &result {
+                    diagnostics.progress(progress, &mut output);
+                }
                 let _send_result = reply.send(result);
             }
             ControllerRequest::Readiness { deadline, reply } => {
                 if Instant::now() >= deadline {
-                    let _send_result = reply.send(ClusterRaftReadiness::new(
-                        ClusterRaftReadinessStatus::ProbeTimedOut,
-                        None,
-                    ));
+                    let result =
+                        ClusterRaftReadiness::new(ClusterRaftReadinessStatus::ProbeTimedOut, None);
+                    diagnostics.readiness(&result, &mut output);
+                    let _send_result = reply.send(result);
                     continue;
                 }
                 let result = runtime.block_on(running.readiness(deadline));
+                diagnostics.readiness(&result, &mut output);
                 let _send_result = reply.send(result);
             }
             ControllerRequest::GroupDirectory { deadline, reply } => {
                 let result = runtime.block_on(running.group_directory(deadline));
                 let _send_result = reply.send(result);
             }
+            ControllerRequest::CommandSessionOwnerStatus {
+                session_id,
+                deadline,
+                reply,
+            } => {
+                let result =
+                    runtime.block_on(running.command_session_owner_status(&session_id, deadline));
+                let _send_result = reply.send(result);
+            }
             ControllerRequest::Shutdown { reply } => {
                 let result = running.stop(&runtime);
+                diagnostics.shutdown(&result, &mut output);
                 let _send_result = reply.send(result);
                 return;
             }
         }
     }
-    let _shutdown_result = running.stop(&runtime);
+    diagnostics.shutdown(&running.stop(&runtime), &mut output);
 }
 
 impl RunningClusterRaft {
@@ -1231,6 +1269,27 @@ impl RunningClusterRaft {
                 readiness.status.as_str()
             ),
         ))
+    }
+
+    async fn command_session_owner_status(
+        &self,
+        session_id: &CommandSessionId,
+        deadline: Instant,
+    ) -> Result<CommandSessionOwnerStatus, BrokerError> {
+        let readiness = self.readiness(deadline).await;
+        if readiness.status != ClusterRaftReadinessStatus::Ready {
+            return Err(BrokerError::new(
+                BrokerErrorCode::TransportError,
+                format!(
+                    "command-session owner status read is unavailable: {}",
+                    readiness.status.as_str()
+                ),
+            ));
+        }
+        // `ensure_linearizable` inside `readiness` waits for the applied index to reach the
+        // quorum-confirmed read log id. The observer returns owner and applied index under one
+        // projection read so this response cannot mix two applied states.
+        Ok(self.observation.session_owner_status(session_id))
     }
 
     async fn progress(&self) -> Result<ClusterRaftProgress, BrokerError> {

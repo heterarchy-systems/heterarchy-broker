@@ -1,6 +1,6 @@
 use crate::{
-    ConsumerGroupId, ConsumerId, Generation, LeaseEpoch, LeaseId, NamespaceId, Revision, TaskId,
-    TaskObjective, TaskStatus, Term, TimestampMs,
+    AuthorityFenceKey, AuthorityRevision, ConsumerGroupId, ConsumerId, Generation, LeaseEpoch,
+    LeaseId, NamespaceId, Revision, TaskId, TaskObjective, TaskStatus, Term, TimestampMs,
 };
 
 /// Authoritative mutation metadata returned after every state-machine command.
@@ -124,6 +124,28 @@ pub struct TermAdvancedResult {
     pub metadata: MutationMetadata,
 }
 
+/// Result of an accepted/idempotent generic authority fence record.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct AuthorityRecordedResult {
+    /// Mutation metadata after the command.
+    pub metadata: MutationMetadata,
+    /// Authority fence key.
+    pub key: AuthorityFenceKey,
+    /// The caller's exact revision now recorded for the key (unchanged on idempotent replay).
+    pub recorded_revision: AuthorityRevision,
+}
+
+/// Result of an accepted/idempotent generic authority fence release.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct AuthorityReleasedResult {
+    /// Mutation metadata after the command.
+    pub metadata: MutationMetadata,
+    /// Authority fence key.
+    pub key: AuthorityFenceKey,
+    /// Retained tombstone floor revision protecting the released key against ABA reuse.
+    pub floor_revision: AuthorityRevision,
+}
+
 /// Explicit changed-entity set emitted for persistence/read-model projection.
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
 pub struct StateChangeSet {
@@ -135,6 +157,8 @@ pub struct StateChangeSet {
     pub deleted_tasks: Vec<TaskId>,
     /// Consumer Group records that changed.
     pub groups: Vec<ConsumerGroupId>,
+    /// Authority fence records that changed.
+    pub authority_fences: Vec<AuthorityFenceKey>,
 }
 
 impl StateChangeSet {
@@ -145,6 +169,7 @@ impl StateChangeSet {
             && self.tasks.is_empty()
             && self.deleted_tasks.is_empty()
             && self.groups.is_empty()
+            && self.authority_fences.is_empty()
     }
 }
 
@@ -171,6 +196,10 @@ pub enum BrokerMutationResult {
     CompletedTasksPruned(CompletedTasksPrunedResult),
     /// Broker term advancement result.
     TermAdvanced(TermAdvancedResult),
+    /// Generic authority fence record result.
+    AuthorityRecorded(AuthorityRecordedResult),
+    /// Generic authority fence release result.
+    AuthorityReleased(AuthorityReleasedResult),
 }
 
 /// State-machine output pairing a typed result with the precise changed entity set.

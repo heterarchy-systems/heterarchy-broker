@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 //! Consensus/commit implementations shared by standalone and future replicated Agent Broker modes.
 
+mod cluster_diagnostics;
 mod cluster_raft;
 mod cluster_tls;
 mod cluster_transport;

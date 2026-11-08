@@ -20,3 +20,5 @@
 **/.DS_Store
 
 /.chatgpt2codex/
+.agents/
+.codegraph/

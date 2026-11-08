@@ -22,10 +22,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Install Rust 1.97
+      - name: Set up Rust 1.98
+        uses: dtolnay/rust-toolchain@1.98
+        with:
+          components: rustfmt, clippy
+
+      - name: Show Rust toolchain
         run: |
-          rustup toolchain install 1.97 --profile minimal --component clippy,rustfmt
-          rustup default 1.97
           rustc --version
           cargo --version
 

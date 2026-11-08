@@ -1,8 +1,9 @@
 use agent_broker_domain::{
-    BrokerCheckpoint, BrokerStateMachine, Capabilities, ConsumerGroupCheckpoint, ConsumerGroupId,
-    ConsumerId, Generation, LeaseEpoch, LeaseId, MemberCheckpoint, NamespaceCheckpoint,
-    NamespaceId, Revision, TaskCheckpoint, TaskCheckpointState, TaskId, TaskObjective, TaskResult,
-    Term, TimestampMs,
+    AuthorityFence, AuthorityFenceCheckpoint, AuthorityFenceKey, AuthorityId, AuthorityOwnerId,
+    AuthorityRevision, BrokerCheckpoint, BrokerStateMachine, Capabilities, ConsumerGroupCheckpoint,
+    ConsumerGroupId, ConsumerId, Generation, LeaseEpoch, LeaseId, MemberCheckpoint,
+    NamespaceCheckpoint, NamespaceId, Revision, TaskCheckpoint, TaskCheckpointState, TaskId,
+    TaskObjective, TaskResult, Term, TimestampMs,
 };
 use serde::{Deserialize, Serialize};
 
@@ -12,12 +13,25 @@ pub(crate) const SCHEMA_VERSION: u64 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct SnapshotWire {
+    /// Additive authority fence section; omitted while empty to preserve byte-exact
+    /// Python-reference encoding for authority-free state, and defaulted on decode so older
+    /// snapshots without the field remain valid.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) authority_fences: Vec<AuthorityFenceWire>,
     pub(crate) groups: Vec<GroupWire>,
     pub(crate) namespaces: Vec<NamespaceWire>,
     pub(crate) revision: u64,
     pub(crate) schema_version: u64,
     pub(crate) tasks: Vec<TaskWire>,
     pub(crate) term: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct AuthorityFenceWire {
+    pub(crate) authority_id: Option<String>,
+    pub(crate) key: String,
+    pub(crate) owner_instance_id: Option<String>,
+    pub(crate) revision: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,12 +79,21 @@ pub(crate) struct TaskWire {
 
 /// Encode the logical Broker checkpoint using the Python snapshot schema-v1 representation.
 ///
+/// The Python reference emits `json.dumps(checkpoint, indent=4)` bytes, so the
+/// encoder must reproduce the same four-space pretty layout to keep the
+/// stored snapshot image byte-compatible with the compatibility corpus.
+///
 /// # Errors
 ///
 /// Returns [`StorageError`] only when JSON serialization fails.
 pub fn encode_snapshot(checkpoint: &BrokerCheckpoint) -> Result<Vec<u8>, StorageError> {
     let wire = checkpoint_to_wire(checkpoint);
-    serde_json::to_vec(&wire).map_err(|error| StorageError::Serialization(error.to_string()))
+    let formatter = serde_json::ser::PrettyFormatter::with_indent(b"    ");
+    let mut buffer = Vec::new();
+    let mut serializer = serde_json::Serializer::with_formatter(&mut buffer, formatter);
+    serde::Serialize::serialize(&wire, &mut serializer)
+        .map_err(|error| StorageError::Serialization(error.to_string()))?;
+    Ok(buffer)
 }
 
 /// Decode and validate one Python-compatible snapshot schema-v1 image.
@@ -87,6 +110,12 @@ pub fn decode_snapshot(bytes: &[u8]) -> Result<BrokerCheckpoint, StorageError> {
 }
 
 pub(crate) fn checkpoint_to_wire(checkpoint: &BrokerCheckpoint) -> SnapshotWire {
+    let mut authority_fences = checkpoint
+        .authority_fences
+        .iter()
+        .map(authority_fence_to_wire)
+        .collect::<Vec<_>>();
+    authority_fences.sort_by(|left, right| left.key.cmp(&right.key));
     let mut namespaces = checkpoint
         .namespaces
         .iter()
@@ -106,6 +135,7 @@ pub(crate) fn checkpoint_to_wire(checkpoint: &BrokerCheckpoint) -> SnapshotWire 
         .collect::<Vec<_>>();
     groups.sort_by(|left, right| left.group_id.cmp(&right.group_id));
     SnapshotWire {
+        authority_fences,
         groups,
         namespaces,
         revision: checkpoint.revision.get(),
@@ -137,9 +167,58 @@ pub(crate) fn snapshot_from_wire(wire: SnapshotWire) -> Result<BrokerCheckpoint,
             .into_iter()
             .map(group_from_wire)
             .collect::<Result<_, _>>()?,
+        authority_fences: wire
+            .authority_fences
+            .into_iter()
+            .map(authority_fence_from_wire)
+            .collect::<Result<_, _>>()?,
     };
     BrokerStateMachine::from_checkpoint(checkpoint.clone())?;
     Ok(checkpoint)
+}
+
+pub(crate) fn authority_fence_to_wire(fence: &AuthorityFenceCheckpoint) -> AuthorityFenceWire {
+    let (authority_id, owner_instance_id) = match &fence.fence {
+        AuthorityFence::Record {
+            authority_id,
+            owner_instance_id,
+            ..
+        } => (
+            Some(authority_id.as_str().to_owned()),
+            Some(owner_instance_id.as_str().to_owned()),
+        ),
+        AuthorityFence::Released { .. } => (None, None),
+    };
+    AuthorityFenceWire {
+        authority_id,
+        key: fence.key.as_str().to_owned(),
+        owner_instance_id,
+        revision: fence.fence.revision().get(),
+    }
+}
+
+pub(crate) fn authority_fence_from_wire(
+    wire: AuthorityFenceWire,
+) -> Result<AuthorityFenceCheckpoint, StorageError> {
+    let key = AuthorityFenceKey::new(wire.key).map_err(invalid_value("authority_fence.key"))?;
+    let revision =
+        AuthorityRevision::new(wire.revision).map_err(invalid_value("authority_fence.revision"))?;
+    let fence = match (wire.authority_id, wire.owner_instance_id) {
+        (Some(authority_id), Some(owner_instance_id)) => AuthorityFence::Record {
+            revision,
+            authority_id: AuthorityId::new(authority_id)
+                .map_err(invalid_value("authority_fence.authority_id"))?,
+            owner_instance_id: AuthorityOwnerId::new(owner_instance_id)
+                .map_err(invalid_value("authority_fence.owner_instance_id"))?,
+        },
+        (None, None) => AuthorityFence::Released { revision },
+        _ => {
+            return Err(invalid_format(
+                "authority fence record and release identities must be all present or all absent",
+            ));
+        }
+    };
+    Ok(AuthorityFenceCheckpoint { key, fence })
 }
 
 pub(crate) fn namespace_to_wire(namespace: &NamespaceCheckpoint) -> NamespaceWire {

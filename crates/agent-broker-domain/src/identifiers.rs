@@ -110,6 +110,9 @@ define_identifier!(TaskId, "task_id");
 define_identifier!(ConsumerGroupId, "group_id");
 define_identifier!(ConsumerId, "member_id");
 define_identifier!(LeaseId, "lease_id");
+define_identifier!(AuthorityFenceKey, "authority_fence_key");
+define_identifier!(AuthorityId, "authority_id");
+define_identifier!(AuthorityOwnerId, "authority_owner_instance_id");
 
 #[cfg(test)]
 mod tests {

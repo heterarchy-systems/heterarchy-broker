@@ -2,24 +2,29 @@ use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use agent_broker_application::{
-    BrokerErrorDisposition, BrokerHealth, CommandIdentity, CommandSessionId, SessionOwnerEpoch,
-    SessionOwnerInstanceId,
+    BrokerErrorDisposition, BrokerHealth, CommandIdentity, CommandSessionId,
+    CommandSessionOwnerStatus, SessionOwnerEpoch, SessionOwnerInstanceId,
 };
 use agent_broker_domain::results::{
     ConsumerGroupResult, HeartbeatResult, NamespaceResult, TaskClaimResult, TaskCompletedResult,
     TaskLeaseRenewedResult, TaskPublishedResult,
 };
 use agent_broker_domain::{
-    ConsumerGroupId, ConsumerId, Generation, NamespaceId, TaskId, TaskObjective,
+    AuthorityFenceKey, AuthorityId, AuthorityOwnerId, AuthorityRevision, ConsumerGroupId,
+    ConsumerId, Generation, NamespaceId, TaskId, TaskObjective,
 };
 use agent_broker_protocol::{
-    BrokerRequest, EnsureConsumerGroupRequest, EnsureNamespaceRequest, HealthRequest,
-    HeartbeatRequest, IdentifiedBrokerRequest, JoinConsumerGroupRequest, LeaveConsumerGroupRequest,
-    Operation, OwnerAcquisitionRequestV3, OwnerIdentifiedBrokerRequestV3, PublishTaskRequest,
-    RequestId, ResponseDecodeError, SuccessPayload, decode_owner_acquisition_response_with_limit,
-    decode_owner_mutation_response_with_limit, decode_response_for_operation_with_limit,
-    decode_response_v2_for_operation_with_limit, encode_identified_request,
-    encode_owner_acquisition_request_with_limit, encode_owner_mutation_request_with_limit,
+    AuthorityRecordRequestV3, AuthorityReleaseRequestV3, BrokerRequest, EnsureConsumerGroupRequest,
+    EnsureNamespaceRequest, HealthRequest, HeartbeatRequest, IdentifiedBrokerRequest,
+    JoinConsumerGroupRequest, LeaveConsumerGroupRequest, Operation, OwnerAcquisitionRequestV3,
+    OwnerIdentifiedBrokerRequestV3, OwnerStatusRequestV3, PublishTaskRequest, RequestId,
+    ResponseDecodeError, SuccessPayload, decode_authority_record_response_with_limit,
+    decode_authority_release_response_with_limit, decode_owner_acquisition_response_with_limit,
+    decode_owner_mutation_response_with_limit, decode_owner_status_response_with_limit,
+    decode_response_for_operation_with_limit, decode_response_v2_for_operation_with_limit,
+    encode_authority_record_request_with_limit, encode_authority_release_request_with_limit,
+    encode_identified_request, encode_owner_acquisition_request_with_limit,
+    encode_owner_mutation_request_with_limit, encode_owner_status_request_with_limit,
     encode_request,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -162,6 +167,157 @@ impl AsyncBrokerClient {
             self.config.max_response_frame_bytes,
         ) {
             Ok(owner_epoch) => Ok(owner_epoch),
+            Err(ResponseDecodeError::Protocol(error)) => Err(ClientError::Protocol(error)),
+            Err(ResponseDecodeError::Broker(error)) => Err(ClientError::Broker(error)),
+        }
+    }
+
+    /// Read the committed owner record of a command session through protocol-v3 `owner.status`.
+    ///
+    /// The read is linearizable on a Raft leader and fails closed otherwise. It never changes an
+    /// owner epoch and grants no ownership. `caller_instance_id` is informational only.
+    ///
+    /// # Errors
+    /// Returns transport/protocol/Broker errors. No automatic retry is performed.
+    pub async fn owner_status(
+        &self,
+        session_id: CommandSessionId,
+        caller_instance_id: SessionOwnerInstanceId,
+    ) -> Result<CommandSessionOwnerStatus, ClientError> {
+        let request_id = self.next_request_id()?;
+        let request = OwnerStatusRequestV3::new(request_id.clone(), session_id, caller_instance_id);
+        let frame =
+            encode_owner_status_request_with_limit(&request, self.config.max_response_frame_bytes)
+                .map_err(ClientError::Protocol)?;
+        let response = self.round_trip_encoded(&frame).await?;
+        match decode_owner_status_response_with_limit(
+            &response,
+            &request_id,
+            self.config.max_response_frame_bytes,
+        ) {
+            Ok(status) => Ok(status),
+            Err(ResponseDecodeError::Protocol(error)) => Err(ClientError::Protocol(error)),
+            Err(ResponseDecodeError::Broker(error)) => Err(ClientError::Broker(error)),
+        }
+    }
+
+    /// Record or succeed one generic authority fence through protocol-v3.
+    ///
+    /// `revision` is the caller's exact monotonic record value (arbitrary values >= 1, including
+    /// gaps), not a compare-and-increment counter. `request_id` correlation reproduces the exact
+    /// deterministic transition on replay but is not a dedup guarantee. No automatic retry.
+    ///
+    /// # Errors
+    /// Returns transport/protocol/Broker errors such as `CONFLICT`, `STALE_FENCE`, or
+    /// `CAPACITY_EXCEEDED`.
+    pub async fn authority_record(
+        &self,
+        key: AuthorityFenceKey,
+        revision: AuthorityRevision,
+        authority_id: AuthorityId,
+        owner_instance_id: AuthorityOwnerId,
+    ) -> Result<AuthorityRevision, ClientError> {
+        let request_id = self.next_request_id()?;
+        self.authority_record_with_request_id(
+            request_id,
+            key,
+            revision,
+            authority_id,
+            owner_instance_id,
+        )
+        .await
+    }
+
+    /// Record an authority fence with a caller-supplied correlation identity.
+    ///
+    /// Retrying with the exact same `request_id` and fields reproduces the exact protocol-v3
+    /// request frame; the server-side transition stays deterministic regardless.
+    ///
+    /// # Errors
+    /// Returns transport/protocol/Broker errors. No automatic retry is performed.
+    pub async fn authority_record_with_request_id(
+        &self,
+        request_id: RequestId,
+        key: AuthorityFenceKey,
+        revision: AuthorityRevision,
+        authority_id: AuthorityId,
+        owner_instance_id: AuthorityOwnerId,
+    ) -> Result<AuthorityRevision, ClientError> {
+        let request = AuthorityRecordRequestV3::new(
+            request_id.clone(),
+            key,
+            revision,
+            authority_id,
+            owner_instance_id,
+        );
+        let frame = encode_authority_record_request_with_limit(
+            &request,
+            self.config.max_response_frame_bytes,
+        )
+        .map_err(ClientError::Protocol)?;
+        let response = self.round_trip_encoded(&frame).await?;
+        match decode_authority_record_response_with_limit(
+            &response,
+            &request_id,
+            self.config.max_response_frame_bytes,
+        ) {
+            Ok(recorded_revision) => Ok(recorded_revision),
+            Err(ResponseDecodeError::Protocol(error)) => Err(ClientError::Protocol(error)),
+            Err(ResponseDecodeError::Broker(error)) => Err(ClientError::Broker(error)),
+        }
+    }
+
+    /// Release one generic authority fence through protocol-v3, tombstoning the key at its
+    /// recorded revision so later records at or below that floor are fenced (`STALE_FENCE`).
+    ///
+    /// # Errors
+    /// Returns transport/protocol/Broker errors such as `NOT_FOUND` or a stale owner/revision
+    /// fence.
+    pub async fn authority_release(
+        &self,
+        key: AuthorityFenceKey,
+        expected_revision: AuthorityRevision,
+        owner_instance_id: AuthorityOwnerId,
+    ) -> Result<AuthorityRevision, ClientError> {
+        let request_id = self.next_request_id()?;
+        self.authority_release_with_request_id(
+            request_id,
+            key,
+            expected_revision,
+            owner_instance_id,
+        )
+        .await
+    }
+
+    /// Release an authority fence with a caller-supplied correlation identity.
+    ///
+    /// # Errors
+    /// Returns transport/protocol/Broker errors. No automatic retry is performed.
+    pub async fn authority_release_with_request_id(
+        &self,
+        request_id: RequestId,
+        key: AuthorityFenceKey,
+        expected_revision: AuthorityRevision,
+        owner_instance_id: AuthorityOwnerId,
+    ) -> Result<AuthorityRevision, ClientError> {
+        let request = AuthorityReleaseRequestV3::new(
+            request_id.clone(),
+            key,
+            expected_revision,
+            owner_instance_id,
+        );
+        let frame = encode_authority_release_request_with_limit(
+            &request,
+            self.config.max_response_frame_bytes,
+        )
+        .map_err(ClientError::Protocol)?;
+        let response = self.round_trip_encoded(&frame).await?;
+        match decode_authority_release_response_with_limit(
+            &response,
+            &request_id,
+            self.config.max_response_frame_bytes,
+        ) {
+            Ok(floor_revision) => Ok(floor_revision),
             Err(ResponseDecodeError::Protocol(error)) => Err(ClientError::Protocol(error)),
             Err(ResponseDecodeError::Broker(error)) => Err(ClientError::Broker(error)),
         }

@@ -30,6 +30,8 @@ impl AgentBrokerRaftLogStorage {
         }
     }
 
+    #[allow(clippy::unused_async_trait_impl)]
+    #[allow(clippy::result_large_err)]
     async fn read_meta<T>(
         &self,
         key: &'static str,
@@ -47,6 +49,8 @@ impl AgentBrokerRaftLogStorage {
         decoded.map_err(read_storage_error)
     }
 
+    #[allow(clippy::unused_async_trait_impl)]
+    #[allow(clippy::result_large_err)]
     async fn write_meta<T>(
         &self,
         key: &'static str,
@@ -112,6 +116,7 @@ impl RaftLogStorage<AgentBrokerRaftTypeConfig> for AgentBrokerRaftLogStorage {
         })
     }
 
+    #[allow(clippy::unused_async_trait_impl)]
     async fn get_log_reader(&mut self) -> Self::LogReader {
         self.clone()
     }

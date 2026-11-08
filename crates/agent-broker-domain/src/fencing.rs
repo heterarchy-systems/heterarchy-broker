@@ -6,6 +6,8 @@ use std::num::NonZeroU64;
 pub enum FencingValueError {
     /// Broker terms are one-based and therefore reject zero.
     ZeroTerm,
+    /// Authority fence revisions are one-based record values and therefore reject zero.
+    ZeroAuthorityRevision,
     /// A bounded Rust counter reached `u64::MAX`; continuing would break monotonic fencing.
     Overflow { counter: &'static str },
 }
@@ -14,6 +16,9 @@ impl fmt::Display for FencingValueError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ZeroTerm => formatter.write_str("broker term must be at least 1"),
+            Self::ZeroAuthorityRevision => {
+                formatter.write_str("authority fence revision must be at least 1")
+            }
             Self::Overflow { counter } => write!(
                 formatter,
                 "{counter} overflowed and cannot advance without violating monotonic fencing"
@@ -117,6 +122,33 @@ define_counter!(
     "revision",
     "Monotonic entity or Broker state revision used for optimistic ordering and replay."
 );
+
+/// Caller-owned exact monotonic record value for one generic authority fence.
+///
+/// This is not a compare-and-increment counter: callers submit the exact revision they intend to
+/// bind (for example a leadership revision observed at confirm time), and arbitrary gaps between
+/// values are valid. The value is one-based so a zero revision can never be recorded.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct AuthorityRevision(NonZeroU64);
+
+impl AuthorityRevision {
+    /// Construct an authority fence revision.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FencingValueError::ZeroAuthorityRevision`] when `value` is zero.
+    pub fn new(value: u64) -> Result<Self, FencingValueError> {
+        NonZeroU64::new(value)
+            .map(Self)
+            .ok_or(FencingValueError::ZeroAuthorityRevision)
+    }
+
+    /// Return the raw revision value for serialization or protocol boundaries.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
 
 #[cfg(test)]
 mod tests {

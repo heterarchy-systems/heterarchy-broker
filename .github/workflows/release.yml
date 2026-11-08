@@ -17,10 +17,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Install Rust 1.97
-        run: |
-          rustup toolchain install 1.97 --profile minimal --component clippy,rustfmt
-          rustup default 1.97
+      - name: Set up Rust 1.98
+        uses: dtolnay/rust-toolchain@1.98
+        with:
+          components: rustfmt, clippy
 
       - name: Install uv and Python 3.11
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0

@@ -1,6 +1,7 @@
 use crate::{
-    Capabilities, ConsumerGroupId, ConsumerId, Generation, LeaseEpoch, LeaseId, NamespaceId,
-    TaskId, TaskObjective, TaskResult, Term, TimestampMs,
+    AuthorityFenceKey, AuthorityId, AuthorityOwnerId, AuthorityRevision, Capabilities,
+    ConsumerGroupId, ConsumerId, Generation, LeaseEpoch, LeaseId, NamespaceId, TaskId,
+    TaskObjective, TaskResult, Term, TimestampMs,
 };
 
 /// Idempotently ensure one project/work namespace exists.
@@ -140,6 +141,36 @@ pub struct AdvanceTermCommand {
     pub new_term: Term,
 }
 
+/// Record or succeed one generic authority fence binding.
+///
+/// This is a provider-neutral fencing record only: it carries no election policy and no
+/// command-session ownership semantics. `revision` is the caller's exact monotonic record value
+/// (arbitrary values >= 1, including gaps), not a compare-and-increment counter.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct RecordAuthorityFenceCommand {
+    /// Bounded authority fence key.
+    pub key: AuthorityFenceKey,
+    /// Caller's exact monotonic record value.
+    pub revision: AuthorityRevision,
+    /// Authority identity claiming the key.
+    pub authority_id: AuthorityId,
+    /// Process/incarnation identity recorded as the owner.
+    pub owner_instance_id: AuthorityOwnerId,
+    /// Server-owned bound on retained records, including tombstones.
+    pub max_authority_fences: usize,
+}
+
+/// Release one generic authority fence, tombstoning the key at its recorded revision.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ReleaseAuthorityFenceCommand {
+    /// Bounded authority fence key.
+    pub key: AuthorityFenceKey,
+    /// Exact revision the releaser believes is currently recorded.
+    pub expected_revision: AuthorityRevision,
+    /// Process/incarnation identity that must currently own the record.
+    pub owner_instance_id: AuthorityOwnerId,
+}
+
 /// Deterministic Broker commands currently implemented by the Rust migration.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum BrokerCommand {
@@ -167,4 +198,8 @@ pub enum BrokerCommand {
     PruneCompletedTasks(PruneCompletedTasksCommand),
     /// Advance Broker term.
     AdvanceTerm(AdvanceTermCommand),
+    /// Record or succeed one generic authority fence.
+    RecordAuthorityFence(RecordAuthorityFenceCommand),
+    /// Release one generic authority fence into an ABA-protecting tombstone.
+    ReleaseAuthorityFence(ReleaseAuthorityFenceCommand),
 }

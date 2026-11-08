@@ -2,14 +2,15 @@ use std::collections::BTreeSet;
 
 use agent_broker_domain::results::StateChangeSet;
 use agent_broker_domain::{
-    BrokerCheckpoint, BrokerState, BrokerStateMachine, ConsumerGroupCheckpoint,
-    NamespaceCheckpoint, Revision, TaskCheckpoint, TaskId, Term,
+    AuthorityFenceCheckpoint, BrokerCheckpoint, BrokerState, BrokerStateMachine,
+    ConsumerGroupCheckpoint, NamespaceCheckpoint, Revision, TaskCheckpoint, TaskId, Term,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::StorageError;
 use crate::snapshot_v1::{
-    GroupWire, NamespaceWire, SCHEMA_VERSION, TaskWire, group_from_wire, group_to_wire,
+    AuthorityFenceWire, GroupWire, NamespaceWire, SCHEMA_VERSION, TaskWire,
+    authority_fence_from_wire, authority_fence_to_wire, group_from_wire, group_to_wire,
     namespace_from_wire, namespace_to_wire, task_from_wire, task_to_wire,
 };
 
@@ -22,11 +23,17 @@ pub struct JournalMutation {
     pub tasks: Vec<TaskCheckpoint>,
     pub deleted_tasks: Vec<TaskId>,
     pub groups: Vec<ConsumerGroupCheckpoint>,
+    /// Additive authority fence upserts; empty for records written before the extension.
+    pub authority_fences: Vec<AuthorityFenceCheckpoint>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct JournalMutationWire {
+    /// Additive section; omitted while empty so authority-free records keep the exact
+    /// Python-reference journal bytes, and defaulted on decode for older records.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    authority_fences: Vec<AuthorityFenceWire>,
     #[serde(default)]
     deleted_tasks: Vec<String>,
     groups: Vec<GroupWire>,
@@ -104,7 +111,25 @@ pub fn encode_journal_mutation(
         .collect::<Vec<_>>();
     deleted_tasks.sort();
 
+    let mut authority_fences = changes
+        .authority_fences
+        .iter()
+        .map(|key| {
+            state
+                .authority_fence(key)
+                .map(|fence| {
+                    authority_fence_to_wire(&AuthorityFenceCheckpoint {
+                        key: key.clone(),
+                        fence: fence.clone(),
+                    })
+                })
+                .ok_or_else(|| missing_changed_entity("authority fence"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    authority_fences.sort_by(|left, right| left.key.cmp(&right.key));
+
     let wire = JournalMutationWire {
+        authority_fences,
         deleted_tasks,
         groups,
         namespaces,
@@ -171,14 +196,19 @@ pub fn decode_journal_mutation(bytes: &[u8]) -> Result<JournalMutation, StorageE
             .namespaces
             .into_iter()
             .map(namespace_from_wire)
-            .collect::<Result<_, _>>()?,
+            .collect::<Result<Vec<_>, _>>()?,
         tasks,
         deleted_tasks,
         groups: wire
             .groups
             .into_iter()
             .map(group_from_wire)
-            .collect::<Result<_, _>>()?,
+            .collect::<Result<Vec<_>, _>>()?,
+        authority_fences: wire
+            .authority_fences
+            .into_iter()
+            .map(authority_fence_from_wire)
+            .collect::<Result<Vec<_>, _>>()?,
     })
 }
 
@@ -215,6 +245,15 @@ pub fn apply_journal_mutation(
         });
     }
 
+    let mut authority_fence_keys = BTreeSet::new();
+    for fence in &mutation.authority_fences {
+        if !authority_fence_keys.insert(&fence.key) {
+            return Err(StorageError::InvalidFormat(
+                "journal mutation contains duplicate authority fence keys".to_owned(),
+            ));
+        }
+    }
+
     let mut candidate = checkpoint.clone();
     for namespace in mutation.namespaces {
         upsert_namespace(&mut candidate.namespaces, namespace)?;
@@ -224,6 +263,9 @@ pub fn apply_journal_mutation(
     }
     for task in mutation.tasks {
         upsert_task(&mut candidate.tasks, task)?;
+    }
+    for fence in mutation.authority_fences {
+        upsert_authority_fence(&mut candidate.authority_fences, fence)?;
     }
     let deleted = mutation.deleted_tasks.into_iter().collect::<BTreeSet<_>>();
     candidate
@@ -285,6 +327,88 @@ fn upsert_task(
     Ok(())
 }
 
+fn upsert_authority_fence(
+    values: &mut Vec<AuthorityFenceCheckpoint>,
+    incoming: AuthorityFenceCheckpoint,
+) -> Result<(), StorageError> {
+    if let Some(existing) = values.iter_mut().find(|item| item.key == incoming.key) {
+        ensure_authority_transition(Some(&existing.fence), &incoming.fence)?;
+        *existing = incoming;
+    } else {
+        ensure_authority_transition(None, &incoming.fence)?;
+        values.push(incoming);
+    }
+    Ok(())
+}
+
+/// Enforce the domain authority record/release transition matrix while replaying persisted state.
+fn ensure_authority_transition(
+    current: Option<&agent_broker_domain::AuthorityFence>,
+    incoming: &agent_broker_domain::AuthorityFence,
+) -> Result<(), StorageError> {
+    use agent_broker_domain::AuthorityFence::{Record, Released};
+
+    let valid = match (current, incoming) {
+        (None, Record { .. }) => true,
+        (None, Released { .. }) => false,
+        (
+            Some(Record {
+                revision: current_revision,
+                authority_id: current_authority_id,
+                owner_instance_id: current_owner_instance_id,
+            }),
+            Record {
+                revision: incoming_revision,
+                authority_id: incoming_authority_id,
+                owner_instance_id: incoming_owner_instance_id,
+            },
+        ) => {
+            (incoming_revision == current_revision
+                && incoming_authority_id == current_authority_id
+                && incoming_owner_instance_id == current_owner_instance_id)
+                || (incoming_revision > current_revision
+                    && incoming_authority_id != current_authority_id)
+        }
+        (
+            Some(Record {
+                revision: current_revision,
+                ..
+            }),
+            Released {
+                revision: incoming_revision,
+            },
+        ) => incoming_revision == current_revision,
+        (
+            Some(Released {
+                revision: current_floor,
+            }),
+            Released {
+                revision: incoming_floor,
+            },
+        ) => incoming_floor == current_floor,
+        (
+            Some(Released {
+                revision: current_floor,
+            }),
+            Record {
+                revision: incoming_revision,
+                ..
+            },
+        ) => incoming_revision > current_floor,
+    };
+    if valid {
+        return Ok(());
+    }
+    if current.is_some_and(|current| incoming.revision() < current.revision()) {
+        return Err(StorageError::EntityRevisionRollback {
+            entity: "authority fence",
+        });
+    }
+    Err(StorageError::InvalidFormat(
+        "journal authority fence transition is not domain-valid".to_owned(),
+    ))
+}
+
 fn ensure_local_revision(
     entity: &'static str,
     current: Revision,
@@ -297,6 +421,9 @@ fn ensure_local_revision(
 }
 
 fn sort_checkpoint(checkpoint: &mut BrokerCheckpoint) {
+    checkpoint
+        .authority_fences
+        .sort_by(|left, right| left.key.cmp(&right.key));
     checkpoint
         .namespaces
         .sort_by(|left, right| left.namespace_id.cmp(&right.namespace_id));

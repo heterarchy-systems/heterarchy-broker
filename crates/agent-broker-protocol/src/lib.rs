@@ -35,9 +35,14 @@ pub use wire_v2::{
     request_version_hint,
 };
 pub use wire_v3::{
-    ACQUIRE_COMMAND_SESSION_OWNER_OPERATION, BrokerRequestV3, OwnerAcquisitionRequestV3,
-    OwnerIdentifiedBrokerRequestV3, PROTOCOL_VERSION_V3,
+    ACQUIRE_COMMAND_SESSION_OWNER_OPERATION, AUTHORITY_RECORD_OPERATION,
+    AUTHORITY_RELEASE_OPERATION, AuthorityRecordRequestV3, AuthorityReleaseRequestV3,
+    BrokerRequestV3, OWNER_STATUS_OPERATION, OwnerAcquisitionRequestV3,
+    OwnerIdentifiedBrokerRequestV3, OwnerStatusRequestV3, PROTOCOL_VERSION_V3,
+    decode_authority_record_response_with_limit, decode_authority_release_response_with_limit,
     decode_owner_acquisition_response_with_limit, decode_owner_mutation_response_with_limit,
-    decode_request_v3_with_limit, encode_owner_acquisition_request_with_limit,
-    encode_owner_mutation_request_with_limit, encode_response_v3_with_limit,
+    decode_owner_status_response_with_limit, decode_request_v3_with_limit,
+    encode_authority_record_request_with_limit, encode_authority_release_request_with_limit,
+    encode_owner_acquisition_request_with_limit, encode_owner_mutation_request_with_limit,
+    encode_owner_status_request_with_limit, encode_response_v3_with_limit,
 };

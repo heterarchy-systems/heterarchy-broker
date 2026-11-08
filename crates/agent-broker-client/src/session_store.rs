@@ -273,6 +273,84 @@ impl DurableClientSessionStore {
         Ok(pending)
     }
 
+    /// Durably reserve a Broker owner acquisition whose CAS expectation is an epoch that the
+    /// caller read from a linearizable Broker `owner.status`.
+    ///
+    /// This exists for operator-approved recovery of a stale local receipt: the local owner epoch
+    /// is behind the Broker-confirmed epoch, so [`Self::begin_owner_acquisition`] would only be
+    /// rejected as stale. The observed epoch must never be lower than the local confirmed epoch,
+    /// and it only becomes the CAS *expectation*; ownership is gained solely when the Broker
+    /// commits `observed + 1` for this instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns operation-blocked while a mutation/acquisition is unresolved, when the instance is
+    /// already the confirmed local owner, or when the observed epoch is lower than the local one.
+    pub fn begin_owner_acquisition_at_observed_epoch(
+        &mut self,
+        owner_instance_id: SessionOwnerInstanceId,
+        observed_owner_epoch: SessionOwnerEpoch,
+    ) -> Result<PendingOwnerAcquisition, ClientSessionStoreError> {
+        if self.state.in_flight.is_some() {
+            return Err(ClientSessionStoreError::OperationBlocked(
+                "cannot acquire a new session owner while an in-flight command is unresolved",
+            ));
+        }
+        if self.state.pending_owner_acquisition.is_some() {
+            return Err(ClientSessionStoreError::OperationBlocked(
+                "session owner acquisition is already pending",
+            ));
+        }
+        if let Some(owner) = self.owner()? {
+            if owner.owner_instance_id == owner_instance_id {
+                return Err(ClientSessionStoreError::OperationBlocked(
+                    "confirmed owner instance must continue its current sequence domain instead of reacquiring ownership",
+                ));
+            }
+            if observed_owner_epoch < owner.owner_epoch {
+                return Err(ClientSessionStoreError::OperationBlocked(
+                    "observed Broker owner epoch is lower than the local confirmed owner epoch",
+                ));
+            }
+        }
+        let pending = PendingOwnerAcquisition {
+            session_id: self.session_id().clone(),
+            expected_owner_epoch: observed_owner_epoch,
+            owner_instance_id,
+        };
+        let mut next = self.state.clone();
+        next.pending_owner_acquisition = Some(PersistedPendingOwnerAcquisition::from(&pending));
+        self.commit_state(next)?;
+        Ok(pending)
+    }
+
+    /// Durably discard a pending owner acquisition that the Broker definitively rejected.
+    ///
+    /// Only an explicit committed `STALE_FENCE`/rejected outcome for this exact pending request
+    /// may justify this call. It must never be used for an unconfirmed or unknown outcome.
+    ///
+    /// # Errors
+    ///
+    /// Returns invalid-state when `pending` does not match the durable pending acquisition.
+    pub fn release_rejected_owner_acquisition(
+        &mut self,
+        pending: &PendingOwnerAcquisition,
+    ) -> Result<(), ClientSessionStoreError> {
+        let current = self.pending_owner_acquisition()?.ok_or_else(|| {
+            ClientSessionStoreError::InvalidState(
+                "cannot release a rejected acquisition without a pending acquisition".to_owned(),
+            )
+        })?;
+        if &current != pending {
+            return Err(ClientSessionStoreError::InvalidState(
+                "rejected acquisition does not match the durable pending acquisition".to_owned(),
+            ));
+        }
+        let mut next = self.state.clone();
+        next.pending_owner_acquisition = None;
+        self.commit_state(next)
+    }
+
     /// Commit a Broker-confirmed owner acquisition into local durable state.
     ///
     /// The Broker may return the expected epoch for a newly bootstrapped v3 session, or exactly

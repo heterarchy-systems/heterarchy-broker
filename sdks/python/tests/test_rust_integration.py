@@ -7,6 +7,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from agent_broker import (
     BrokerClientConfig,
@@ -15,6 +16,82 @@ from agent_broker import (
     StandaloneBrokerClient,
     TransportError,
 )
+
+
+def _agent_brokerd_binary(repo: Path) -> Path:
+    configured_binary = os.environ.get("AGENT_BROKERD_BIN")
+    if configured_binary:
+        binary = Path(configured_binary)
+        if not binary.is_absolute():
+            binary = repo / binary
+    else:
+        configured_target = os.environ.get("CARGO_TARGET_DIR")
+        target_dir = Path(configured_target) if configured_target else repo / "target"
+        if not target_dir.is_absolute():
+            target_dir = repo / target_dir
+        binary = target_dir / "debug" / "agentbrokerd"
+    if os.name == "nt" and binary.suffix.lower() != ".exe":
+        binary = binary.with_name(f"{binary.name}.exe")
+    return binary.resolve()
+
+
+class RustIntegrationPathTests(unittest.TestCase):
+    def test_relative_explicit_binary_path_is_rooted_at_repository(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="agent-broker-binary-path-"
+        ) as temp_dir:
+            repo = Path(temp_dir).resolve()
+            executable_name = "agentbrokerd.exe" if os.name == "nt" else "agentbrokerd"
+            relative_binary = Path("prebuilt") / executable_name
+            expected = repo / relative_binary
+            expected.parent.mkdir()
+            expected.touch()
+
+            with patch.dict(os.environ, {"AGENT_BROKERD_BIN": str(relative_binary)}):
+                binary = _agent_brokerd_binary(repo)
+                self.assertEqual(binary, expected.resolve())
+                self.assertTrue(binary.is_file())
+
+    def test_relative_cargo_target_directory_is_rooted_at_repository(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="agent-broker-target-path-"
+        ) as temp_dir:
+            repo = Path(temp_dir).resolve()
+            executable_name = "agentbrokerd.exe" if os.name == "nt" else "agentbrokerd"
+            with patch.dict(
+                os.environ,
+                {"AGENT_BROKERD_BIN": "", "CARGO_TARGET_DIR": "build-output"},
+            ):
+                binary = _agent_brokerd_binary(repo)
+
+        self.assertEqual(
+            binary, (repo / "build-output" / "debug" / executable_name).resolve()
+        )
+        with (
+            patch.dict(
+                os.environ,
+                {"AGENT_BROKERD_BIN": "", "CARGO_TARGET_DIR": "build-output"},
+            ),
+            patch("os.name", "nt"),
+        ):
+            windows_binary = _agent_brokerd_binary(repo)
+        self.assertEqual(windows_binary.name, "agentbrokerd.exe")
+
+    def test_unconfigured_target_directory_uses_repository_target(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="agent-broker-default-target-"
+        ) as temp_dir:
+            repo = Path(temp_dir).resolve()
+            executable_name = "agentbrokerd.exe" if os.name == "nt" else "agentbrokerd"
+            with patch.dict(os.environ):
+                os.environ.pop("CARGO_TARGET_DIR", None)
+                os.environ.pop("AGENT_BROKERD_BIN", None)
+                binary = _agent_brokerd_binary(repo)
+
+        self.assertEqual(
+            binary,
+            (repo / "target" / "debug" / executable_name).resolve(),
+        )
 
 
 @unittest.skipUnless(
@@ -37,7 +114,8 @@ class RustStandaloneIntegrationTests(unittest.TestCase):
             cwd=repo,
             check=True,
         )
-        binary = repo / "target" / "debug" / "agentbrokerd"
+        binary = _agent_brokerd_binary(repo)
+        self.assertTrue(binary.is_file(), f"Rust Broker binary is missing: {binary}")
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
             probe.bind(("127.0.0.1", 0))
             port = probe.getsockname()[1]

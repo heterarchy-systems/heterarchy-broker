@@ -3,27 +3,32 @@ use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::error::Error;
 use std::fmt;
 
+use crate::authority::{
+    AuthorityFence, AuthorityFenceError, record_authority_fence, release_authority_fence,
+};
 use crate::checkpoint::{
-    BrokerCheckpoint, CheckpointError, ConsumerGroupCheckpoint, NamespaceCheckpoint,
+    AuthorityFenceCheckpoint, BrokerCheckpoint, CheckpointError, ConsumerGroupCheckpoint,
+    NamespaceCheckpoint,
 };
 use crate::commands::{
     AdvanceTermCommand, BrokerCommand, ClaimTaskCommand, CompleteTaskCommand,
     EnsureConsumerGroupCommand, EnsureNamespaceCommand, HeartbeatCommand, JoinConsumerGroupCommand,
     LeaveConsumerGroupCommand, PruneCompletedTasksCommand, PublishTaskCommand,
-    ReapStaleMembersCommand, RenewTaskLeaseCommand,
+    ReapStaleMembersCommand, RecordAuthorityFenceCommand, ReleaseAuthorityFenceCommand,
+    RenewTaskLeaseCommand,
 };
 use crate::group::{GroupCoordinator, GroupCoordinatorError};
 use crate::results::{
-    AppliedMutation, BrokerMutationResult, CompletedTasksPrunedResult, ConsumerGroupResult,
-    HeartbeatResult, MutationMetadata, NamespaceResult, StaleMembersReapedResult, StateChangeSet,
-    TaskClaimResult, TaskCompletedResult, TaskLeaseRenewedResult, TaskPublishedResult,
-    TermAdvancedResult,
+    AppliedMutation, AuthorityRecordedResult, AuthorityReleasedResult, BrokerMutationResult,
+    CompletedTasksPrunedResult, ConsumerGroupResult, HeartbeatResult, MutationMetadata,
+    NamespaceResult, StaleMembersReapedResult, StateChangeSet, TaskClaimResult,
+    TaskCompletedResult, TaskLeaseRenewedResult, TaskPublishedResult, TermAdvancedResult,
 };
 use crate::{
-    Capabilities, CompletionOutcome, ConsumerGroup, ConsumerGroupDirectory, ConsumerGroupError,
-    ConsumerGroupId, ConsumerGroupSummary, ConsumerId, Generation, HeartbeatOutcome, JoinOutcome,
-    LeaseEpoch, LeaseFence, LeaseGrant, LeaseId, NamespaceId, Revision, Task, TaskId, TaskState,
-    TaskStatus, TaskTransitionError, Term, TimestampMs,
+    AuthorityFenceKey, Capabilities, CompletionOutcome, ConsumerGroup, ConsumerGroupDirectory,
+    ConsumerGroupError, ConsumerGroupId, ConsumerGroupSummary, ConsumerId, Generation,
+    HeartbeatOutcome, JoinOutcome, LeaseEpoch, LeaseFence, LeaseGrant, LeaseId, NamespaceId,
+    Revision, Task, TaskId, TaskState, TaskStatus, TaskTransitionError, Term, TimestampMs,
 };
 
 type ReadyTaskHeap = BinaryHeap<Reverse<(TimestampMs, TaskId)>>;
@@ -82,6 +87,7 @@ pub struct BrokerState {
     namespaces: BTreeMap<NamespaceId, Namespace>,
     tasks: BTreeMap<TaskId, Task>,
     groups: BTreeMap<ConsumerGroupId, ConsumerGroup>,
+    authority_fences: BTreeMap<AuthorityFenceKey, AuthorityFence>,
 }
 
 impl Default for BrokerState {
@@ -92,6 +98,7 @@ impl Default for BrokerState {
             namespaces: BTreeMap::new(),
             tasks: BTreeMap::new(),
             groups: BTreeMap::new(),
+            authority_fences: BTreeMap::new(),
         }
     }
 }
@@ -145,6 +152,18 @@ impl BrokerState {
         self.groups.len()
     }
 
+    /// Return retained authority fence record count, including tombstones.
+    #[must_use]
+    pub fn authority_fence_count(&self) -> usize {
+        self.authority_fences.len()
+    }
+
+    /// Borrow one generic authority fence by key.
+    #[must_use]
+    pub fn authority_fence(&self, key: &AuthorityFenceKey) -> Option<&AuthorityFence> {
+        self.authority_fences.get(key)
+    }
+
     /// Return deterministic Consumer Group summaries ordered by Group ID.
     #[must_use]
     pub fn group_summaries(&self) -> Vec<ConsumerGroupSummary> {
@@ -179,6 +198,14 @@ impl BrokerState {
                 .groups
                 .values()
                 .map(ConsumerGroup::checkpoint)
+                .collect(),
+            authority_fences: self
+                .authority_fences
+                .iter()
+                .map(|(key, fence)| AuthorityFenceCheckpoint {
+                    key: key.clone(),
+                    fence: fence.clone(),
+                })
                 .collect(),
         }
     }
@@ -215,6 +242,8 @@ pub enum StateMachineError {
     ConsumerGroupNotFound(ConsumerGroupId),
     /// Consumer Group/member transition rejected the command.
     ConsumerGroupTransition(ConsumerGroupError),
+    /// Generic authority fence transition rejected the command.
+    AuthorityFence(AuthorityFenceError),
     /// Global Broker revision could not advance safely.
     FencingValue(crate::FencingValueError),
 }
@@ -267,7 +296,40 @@ impl fmt::Display for StateMachineError {
                 write!(formatter, "Consumer Group {group_id} does not exist")
             }
             Self::ConsumerGroupTransition(error) => error.fmt(formatter),
+            Self::AuthorityFence(error) => authority_fence_error_message(error).fmt(formatter),
             Self::FencingValue(error) => error.fmt(formatter),
+        }
+    }
+}
+
+fn authority_fence_error_message(error: &AuthorityFenceError) -> String {
+    match error {
+        AuthorityFenceError::ReplayConflict {
+            key,
+            recorded,
+            requested,
+        } => format!(
+            "authority fence {key} is already bound to authority revision {} and cannot replay at revision {}",
+            recorded.get(),
+            requested.get()
+        ),
+        AuthorityFenceError::Superseded {
+            key,
+            recorded,
+            requested,
+        } => format!(
+            "authority fence {key} is already superseded at revision {}; requested revision {} is stale",
+            recorded.get(),
+            requested.get()
+        ),
+        AuthorityFenceError::NotOwner { key } => {
+            format!("authority fence {key} is not owned by the releasing instance")
+        }
+        AuthorityFenceError::NotFound(key) => {
+            format!("authority fence {key} does not exist")
+        }
+        AuthorityFenceError::CapacityExceeded { max } => {
+            format!("authority fence capacity reached ({max})")
         }
     }
 }
@@ -325,6 +387,7 @@ pub struct BrokerStateMachine {
     changed_tasks: BTreeSet<TaskId>,
     deleted_tasks: BTreeSet<TaskId>,
     changed_groups: BTreeSet<ConsumerGroupId>,
+    changed_authority_fences: BTreeSet<AuthorityFenceKey>,
 }
 
 #[derive(Debug, Default)]
@@ -392,6 +455,7 @@ impl BrokerStateMachine {
             changed_tasks: BTreeSet::new(),
             deleted_tasks: BTreeSet::new(),
             changed_groups: BTreeSet::new(),
+            changed_authority_fences: BTreeSet::new(),
         })
     }
 
@@ -402,6 +466,7 @@ impl BrokerStateMachine {
             namespaces,
             tasks,
             groups,
+            authority_fences,
         } = checkpoint;
         let mut state = BrokerState {
             term,
@@ -409,6 +474,7 @@ impl BrokerStateMachine {
             namespaces: BTreeMap::new(),
             tasks: BTreeMap::new(),
             groups: BTreeMap::new(),
+            authority_fences: BTreeMap::new(),
         };
 
         for namespace_checkpoint in namespaces {
@@ -420,7 +486,25 @@ impl BrokerStateMachine {
         for task_checkpoint in tasks {
             Self::restore_task(&mut state, task_checkpoint)?;
         }
+        for fence_checkpoint in authority_fences {
+            Self::restore_authority_fence(&mut state, fence_checkpoint)?;
+        }
         Ok(state)
+    }
+
+    fn restore_authority_fence(
+        state: &mut BrokerState,
+        checkpoint: AuthorityFenceCheckpoint,
+    ) -> Result<(), CheckpointError> {
+        let key = checkpoint.key;
+        if state
+            .authority_fences
+            .insert(key.clone(), checkpoint.fence)
+            .is_some()
+        {
+            return Err(CheckpointError::DuplicateAuthorityFence(key));
+        }
+        Ok(())
     }
 
     fn restore_namespace(
@@ -604,6 +688,12 @@ impl BrokerStateMachine {
             }
             BrokerCommand::AdvanceTerm(command) => {
                 BrokerMutationResult::TermAdvanced(self.advance_term(command)?)
+            }
+            BrokerCommand::RecordAuthorityFence(command) => {
+                BrokerMutationResult::AuthorityRecorded(self.record_authority_fence(command)?)
+            }
+            BrokerCommand::ReleaseAuthorityFence(command) => {
+                BrokerMutationResult::AuthorityReleased(self.release_authority_fence(command)?)
             }
         };
         Ok(AppliedMutation {
@@ -1261,6 +1351,58 @@ impl BrokerStateMachine {
         })
     }
 
+    fn record_authority_fence(
+        &mut self,
+        command: RecordAuthorityFenceCommand,
+    ) -> Result<AuthorityRecordedResult, StateMachineError> {
+        let next_fence = record_authority_fence(
+            &self.state.authority_fences,
+            command.key.clone(),
+            command.revision,
+            command.authority_id,
+            command.owner_instance_id,
+            command.max_authority_fences,
+        )
+        .map_err(StateMachineError::AuthorityFence)?;
+        let key = command.key;
+        if let Some(fence) = next_fence {
+            let next_revision = self.state.revision.next()?;
+            self.state.authority_fences.insert(key.clone(), fence);
+            self.state.revision = next_revision;
+            self.changed_authority_fences.insert(key.clone());
+        }
+        Ok(AuthorityRecordedResult {
+            metadata: self.metadata(),
+            key,
+            recorded_revision: command.revision,
+        })
+    }
+
+    fn release_authority_fence(
+        &mut self,
+        command: ReleaseAuthorityFenceCommand,
+    ) -> Result<AuthorityReleasedResult, StateMachineError> {
+        let tombstone = release_authority_fence(
+            &self.state.authority_fences,
+            command.key.clone(),
+            command.expected_revision,
+            &command.owner_instance_id,
+        )
+        .map_err(StateMachineError::AuthorityFence)?;
+        let key = command.key;
+        if let Some(fence) = tombstone {
+            let next_revision = self.state.revision.next()?;
+            self.state.authority_fences.insert(key.clone(), fence);
+            self.state.revision = next_revision;
+            self.changed_authority_fences.insert(key.clone());
+        }
+        Ok(AuthorityReleasedResult {
+            metadata: self.metadata(),
+            key,
+            floor_revision: command.expected_revision,
+        })
+    }
+
     fn require_term(&self, expected: Term) -> Result<(), StateMachineError> {
         if self.state.term == expected {
             return Ok(());
@@ -1531,6 +1673,7 @@ impl BrokerStateMachine {
         self.changed_tasks.clear();
         self.deleted_tasks.clear();
         self.changed_groups.clear();
+        self.changed_authority_fences.clear();
     }
 
     fn take_changes(&self) -> StateChangeSet {
@@ -1539,6 +1682,7 @@ impl BrokerStateMachine {
             tasks: self.changed_tasks.iter().cloned().collect(),
             deleted_tasks: self.deleted_tasks.iter().cloned().collect(),
             groups: self.changed_groups.iter().cloned().collect(),
+            authority_fences: self.changed_authority_fences.iter().cloned().collect(),
         }
     }
 }

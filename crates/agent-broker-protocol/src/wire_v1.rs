@@ -1177,6 +1177,14 @@ fn success_payload(payload: &SuccessPayload) -> Result<Value, ProtocolCodecError
         SuccessPayload::SessionOwnerAcquired { .. } => Err(ProtocolCodecError::InvalidRequest(
             "command-session owner acquisition is not a protocol-v1 response".to_owned(),
         )),
+        SuccessPayload::SessionOwnerStatus { .. } => Err(ProtocolCodecError::InvalidRequest(
+            "command-session owner status is protocol-v3 only".to_owned(),
+        )),
+        SuccessPayload::AuthorityRecorded { .. } | SuccessPayload::AuthorityReleased { .. } => {
+            Err(ProtocolCodecError::InvalidRequest(
+                "authority fence responses are protocol-v3 only".to_owned(),
+            ))
+        }
     }
 }
 

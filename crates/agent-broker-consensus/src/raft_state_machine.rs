@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use agent_broker_application::{
     BrokerError, BrokerErrorCode, BrokerErrorDisposition, CommandIdentity, CommandSequence,
-    CommandSessionId, SessionOwnerEpoch, SessionOwnerInstanceId,
+    CommandSessionId, CommandSessionOwnerRecord, SessionOwnerEpoch, SessionOwnerInstanceId,
 };
 use agent_broker_domain::{BrokerCheckpoint, BrokerState, BrokerStateMachine};
 use agent_broker_storage::{decode_snapshot, encode_snapshot};
@@ -53,6 +53,7 @@ pub(crate) struct AgentBrokerRaftStateMachine {
 }
 
 impl AgentBrokerRaftStateMachine {
+    #[allow(clippy::result_large_err)]
     pub(crate) async fn load(
         persistence: RedbRaftPersistence,
         observation: Arc<RaftBrokerObservation>,
@@ -63,7 +64,11 @@ impl AgentBrokerRaftStateMachine {
                 .map_err(|error| StorageIOError::read_snapshot(Some(meta.signature()), &error))?;
             let broker = BrokerStateMachine::from_checkpoint(decoded.checkpoint)
                 .map_err(|error| StorageIOError::read_state_machine(&error))?;
-            observation.update(broker.state(), meta.last_log_id.map(|log_id| log_id.index));
+            observation.update_state(broker.state());
+            observation.replace_session_owner_projection(
+                owner_projection(&decoded.command_sessions),
+                meta.last_log_id.map(|log_id| log_id.index),
+            );
             return Ok(Self {
                 persistence,
                 broker,
@@ -77,7 +82,8 @@ impl AgentBrokerRaftStateMachine {
         let checkpoint = BrokerState::default().checkpoint();
         let broker = BrokerStateMachine::from_checkpoint(checkpoint)
             .map_err(|error| StorageIOError::read_state_machine(&error))?;
-        observation.update(broker.state(), None);
+        observation.update_state(broker.state());
+        observation.replace_session_owner_projection(BTreeMap::new(), None);
         Ok(Self {
             persistence,
             broker,
@@ -88,10 +94,19 @@ impl AgentBrokerRaftStateMachine {
         })
     }
 
+    #[cfg(test)]
     fn apply_proposal(
         &mut self,
         proposal: ReplicatedBrokerProposalV1,
     ) -> io::Result<ReplicatedBrokerResponseV1> {
+        self.apply_proposal_with_session_owner(proposal)
+            .map(|(response, _)| response)
+    }
+
+    fn apply_proposal_with_session_owner(
+        &mut self,
+        proposal: ReplicatedBrokerProposalV1,
+    ) -> io::Result<(ReplicatedBrokerResponseV1, Option<CommandSessionId>)> {
         let (identity, command) = proposal.into_parts().map_err(invalid_state_machine_data)?;
         match command {
             ReplicatedBrokerCommandV1::AcquireCommandSessionOwner {
@@ -104,15 +119,33 @@ impl AgentBrokerRaftStateMachine {
                         "command-session owner acquisition must not carry identified mutation identity",
                     ));
                 }
-                self.acquire_command_session_owner(
+                let touched_session = CommandSessionId::new(session_id.clone()).ok();
+                let response = self.acquire_command_session_owner(
                     session_id,
                     expected_owner_epoch,
                     owner_instance_id,
-                )
+                )?;
+                Ok((response, touched_session))
+            }
+            ReplicatedBrokerCommandV1::RecordAuthorityFence { .. }
+            | ReplicatedBrokerCommandV1::ReleaseAuthorityFence { .. } => {
+                if identity.is_some() {
+                    return Err(invalid_state_machine_data(
+                        "authority fence transitions must not carry identified mutation identity",
+                    ));
+                }
+                self.apply_replicated_command(command)
+                    .map(|response| (response, None))
             }
             command => match identity {
-                Some(identity) => self.apply_identified(&identity, command),
-                None => self.apply_replicated_command(command),
+                Some(identity) => {
+                    let touched_session = identity.session_id().clone();
+                    self.apply_identified(&identity, command)
+                        .map(|response| (response, Some(touched_session)))
+                }
+                None => self
+                    .apply_replicated_command(command)
+                    .map(|response| (response, None)),
             },
         }
     }
@@ -319,6 +352,22 @@ impl AgentBrokerRaftStateMachine {
     }
 }
 
+fn session_owner_record(record: &CommandSessionRecord) -> CommandSessionOwnerRecord {
+    CommandSessionOwnerRecord {
+        owner_epoch: record.owner_epoch,
+        owner_instance_id: record.owner_instance_id.clone(),
+    }
+}
+
+fn owner_projection(
+    sessions: &BTreeMap<CommandSessionId, CommandSessionRecord>,
+) -> BTreeMap<CommandSessionId, CommandSessionOwnerRecord> {
+    sessions
+        .iter()
+        .map(|(id, record)| (id.clone(), session_owner_record(record)))
+        .collect()
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct AgentBrokerRaftSnapshotBuilder {
     persistence: RedbRaftPersistence,
@@ -351,6 +400,7 @@ impl RaftSnapshotBuilder<AgentBrokerRaftTypeConfig> for AgentBrokerRaftSnapshotB
 impl RaftStateMachine<AgentBrokerRaftTypeConfig> for AgentBrokerRaftStateMachine {
     type SnapshotBuilder = AgentBrokerRaftSnapshotBuilder;
 
+    #[allow(clippy::unused_async_trait_impl)]
     async fn applied_state(
         &mut self,
     ) -> Result<
@@ -363,6 +413,7 @@ impl RaftStateMachine<AgentBrokerRaftTypeConfig> for AgentBrokerRaftStateMachine
         Ok((self.last_applied, self.last_membership.clone()))
     }
 
+    #[allow(clippy::unused_async_trait_impl)]
     async fn apply<I>(
         &mut self,
         entries: I,
@@ -374,26 +425,34 @@ impl RaftStateMachine<AgentBrokerRaftTypeConfig> for AgentBrokerRaftStateMachine
         let mut responses = Vec::new();
         for entry in entries {
             let log_id = entry.log_id;
-            let response = match entry.payload {
-                EntryPayload::Blank => ReplicatedBrokerResponseV1::RaftControl,
+            let (response, touched_session_id) = match entry.payload {
+                EntryPayload::Blank => (ReplicatedBrokerResponseV1::RaftControl, None),
                 EntryPayload::Membership(membership) => {
                     self.last_membership = StoredMembership::new(Some(log_id), membership);
-                    ReplicatedBrokerResponseV1::RaftControl
+                    (ReplicatedBrokerResponseV1::RaftControl, None)
                 }
                 EntryPayload::Normal(data) => self
-                    .apply_proposal(data)
+                    .apply_proposal_with_session_owner(data)
                     .map_err(|error| StorageIOError::read_state_machine(&error))?,
             };
             self.last_applied = Some(log_id);
-            self.observation.update(
-                self.broker.state(),
-                self.last_applied.map(|applied| applied.index),
-            );
+            self.observation.update_state(self.broker.state());
+            let touched_owner = touched_session_id.as_ref().map(|session_id| {
+                (
+                    session_id,
+                    self.command_sessions
+                        .get(session_id)
+                        .map(session_owner_record),
+                )
+            });
+            self.observation
+                .publish_applied_entry(log_id.index, touched_owner);
             responses.push(response);
         }
         Ok(responses)
     }
 
+    #[allow(clippy::unused_async_trait_impl)]
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
         AgentBrokerRaftSnapshotBuilder {
             persistence: self.persistence.clone(),
@@ -404,6 +463,7 @@ impl RaftStateMachine<AgentBrokerRaftTypeConfig> for AgentBrokerRaftStateMachine
         }
     }
 
+    #[allow(clippy::unused_async_trait_impl)]
     async fn begin_receiving_snapshot(
         &mut self,
     ) -> Result<Box<Cursor<Vec<u8>>>, StorageError<AgentBrokerRaftNodeId>> {
@@ -427,8 +487,9 @@ impl RaftStateMachine<AgentBrokerRaftTypeConfig> for AgentBrokerRaftStateMachine
         self.command_sessions = decoded.command_sessions;
         self.last_applied = meta.last_log_id;
         self.last_membership = meta.last_membership.clone();
-        self.observation.update(
-            self.broker.state(),
+        self.observation.update_state(self.broker.state());
+        self.observation.replace_session_owner_projection(
+            owner_projection(&self.command_sessions),
             self.last_applied.map(|applied| applied.index),
         );
         Ok(())
@@ -452,6 +513,7 @@ impl RaftStateMachine<AgentBrokerRaftTypeConfig> for AgentBrokerRaftStateMachine
     }
 }
 
+#[allow(clippy::unused_async_trait_impl, clippy::result_large_err)]
 async fn persist_snapshot(
     persistence: RedbRaftPersistence,
     meta: &SnapshotMeta<AgentBrokerRaftNodeId, BasicNode>,
@@ -473,6 +535,7 @@ async fn persist_snapshot(
     .map_err(|error| StorageIOError::write_snapshot(Some(signature), &error).into())
 }
 
+#[allow(clippy::unused_async_trait_impl, clippy::result_large_err)]
 async fn read_snapshot_pair(
     persistence: RedbRaftPersistence,
 ) -> Result<
@@ -772,18 +835,21 @@ mod tests {
     use std::sync::Arc;
 
     use agent_broker_application::{
-        BrokerErrorCode, CommandIdentity, CommandSequence, CommandSessionId, SessionOwnerEpoch,
-        SessionOwnerInstanceId,
+        BrokerErrorCode, CommandIdentity, CommandSequence, CommandSessionId,
+        CommandSessionOwnerStatus, SessionOwnerEpoch, SessionOwnerInstanceId,
     };
     use agent_broker_domain::commands::{BrokerCommand, EnsureNamespaceCommand};
     use agent_broker_domain::{BrokerState, NamespaceId};
     use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
-    use openraft::{SnapshotMeta, StoredMembership};
+    use openraft::{
+        BasicNode, CommittedLeaderId, Entry, EntryPayload, LogId, SnapshotMeta, StoredMembership,
+    };
     use tempfile::tempdir;
 
     use super::{AgentBrokerRaftStateMachine, read_snapshot_pair};
     use crate::raft_observation::RaftBrokerObservation;
     use crate::raft_persistence::RedbRaftPersistence;
+    use crate::raft_type_config::{AgentBrokerRaftNodeId, AgentBrokerRaftTypeConfig};
     use crate::{ReplicatedBrokerCommandV1, ReplicatedBrokerProposalV1};
 
     #[tokio::test]
@@ -1174,7 +1240,7 @@ mod tests {
         let epoch_two_identity = CommandIdentity::new_with_owner(
             session_id.clone(),
             epoch_two,
-            owner_instance,
+            owner_instance.clone(),
             CommandSequence::new(1)?,
         );
         let epoch_two_command = ReplicatedBrokerCommandV1::try_from(
@@ -1188,6 +1254,9 @@ mod tests {
         let committed = state_machine.apply_proposal(epoch_two_proposal.clone())?;
         let mut builder = state_machine.get_snapshot_builder().await;
         let _snapshot = builder.build_snapshot().await?;
+        let (snapshot_meta, snapshot_data) = read_snapshot_pair(persistence.clone())
+            .await?
+            .ok_or("snapshot builder did not persist a snapshot")?;
         drop(state_machine);
 
         let recovered_observation =
@@ -1195,8 +1264,18 @@ mod tests {
         let mut recovered =
             AgentBrokerRaftStateMachine::load(persistence, Arc::clone(&recovered_observation))
                 .await?;
-        let stale_identity =
-            CommandIdentity::new_with_owner_epoch(session_id, epoch_one, CommandSequence::new(2)?);
+        let loaded_status = recovered_observation.session_owner_status(&session_id);
+        assert_owner_status(&loaded_status, epoch_two, &owner_instance, 0);
+        let installed_status =
+            install_snapshot_and_read_owner_status(&session_id, &snapshot_meta, snapshot_data)
+                .await?;
+        assert_eq!(installed_status, loaded_status);
+
+        let stale_identity = CommandIdentity::new_with_owner_epoch(
+            session_id.clone(),
+            epoch_one,
+            CommandSequence::new(2)?,
+        );
         let stale_command = ReplicatedBrokerCommandV1::try_from(BrokerCommand::EnsureNamespace(
             EnsureNamespaceCommand {
                 namespace_id: NamespaceId::new("owner-snapshot-stale")?,
@@ -1220,6 +1299,250 @@ mod tests {
         assert_eq!(stale_error.code(), BrokerErrorCode::StaleFence);
         let retry = recovered.apply_proposal(epoch_two_proposal)?;
         assert_eq!(retry, committed);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn applied_owner_and_blank_entries_keep_projection_coherent() -> Result<(), Box<dyn Error>>
+    {
+        let directory = tempdir()?;
+        let persistence = RedbRaftPersistence::open(directory.path().join("raft.redb"))?;
+        let observation = Arc::new(RaftBrokerObservation::new(&BrokerState::default(), None));
+        let mut state_machine =
+            AgentBrokerRaftStateMachine::load(persistence, Arc::clone(&observation)).await?;
+        let session_id = CommandSessionId::new("owner-applied-entry-client")?;
+        let owner_instance = SessionOwnerInstanceId::new("owner-applied-entry-process")?;
+        let proposal = ReplicatedBrokerProposalV1::legacy(
+            ReplicatedBrokerCommandV1::AcquireCommandSessionOwner {
+                session_id: session_id.as_str().to_owned(),
+                expected_owner_epoch: SessionOwnerEpoch::INITIAL.get(),
+                owner_instance_id: owner_instance.as_str().to_owned(),
+            },
+        );
+
+        let owner_responses = state_machine
+            .apply([Entry::<AgentBrokerRaftTypeConfig> {
+                log_id: LogId::new(CommittedLeaderId::new(1, 1), 1),
+                payload: EntryPayload::Normal(proposal),
+            }])
+            .await?;
+        assert_eq!(
+            owner_responses,
+            vec![crate::ReplicatedBrokerResponseV1::SessionOwnerAcquired { owner_epoch: 1 }]
+        );
+        let owner_status = observation.session_owner_status(&session_id);
+        assert_owner_status(
+            &owner_status,
+            SessionOwnerEpoch::INITIAL,
+            &owner_instance,
+            1,
+        );
+
+        let blank_responses = state_machine
+            .apply([Entry::<AgentBrokerRaftTypeConfig> {
+                log_id: LogId::new(CommittedLeaderId::new(1, 1), 2),
+                payload: EntryPayload::Blank,
+            }])
+            .await?;
+        assert_eq!(
+            blank_responses,
+            vec![crate::ReplicatedBrokerResponseV1::RaftControl]
+        );
+        let owner_after_blank = observation.session_owner_status(&session_id);
+        assert_eq!(owner_after_blank.owner, owner_status.owner);
+        assert_eq!(owner_after_blank.applied_index, 2);
+        Ok(())
+    }
+
+    fn assert_owner_status(
+        status: &CommandSessionOwnerStatus,
+        owner_epoch: SessionOwnerEpoch,
+        owner_instance: &SessionOwnerInstanceId,
+        applied_index: u64,
+    ) {
+        assert_eq!(
+            status.owner.as_ref().map(|owner| owner.owner_epoch),
+            Some(owner_epoch)
+        );
+        assert_eq!(
+            status
+                .owner
+                .as_ref()
+                .and_then(|owner| owner.owner_instance_id.as_ref()),
+            Some(owner_instance)
+        );
+        assert_eq!(status.applied_index, applied_index);
+    }
+
+    async fn install_snapshot_and_read_owner_status(
+        session_id: &CommandSessionId,
+        snapshot_meta: &SnapshotMeta<AgentBrokerRaftNodeId, BasicNode>,
+        snapshot_data: Vec<u8>,
+    ) -> Result<CommandSessionOwnerStatus, Box<dyn Error>> {
+        let directory = tempdir()?;
+        let persistence = RedbRaftPersistence::open(directory.path().join("raft.redb"))?;
+        let observation = Arc::new(RaftBrokerObservation::new(
+            &BrokerState::default(),
+            Some(99),
+        ));
+        let mut state_machine =
+            AgentBrokerRaftStateMachine::load(persistence, Arc::clone(&observation)).await?;
+        state_machine
+            .install_snapshot(snapshot_meta, Box::new(Cursor::new(snapshot_data)))
+            .await?;
+        Ok(observation.session_owner_status(session_id))
+    }
+
+    #[tokio::test]
+    async fn authority_fence_rejects_command_session_identity_without_mutation()
+    -> Result<(), Box<dyn Error>> {
+        use agent_broker_domain::AuthorityFenceKey;
+
+        let directory = tempdir()?;
+        let persistence = RedbRaftPersistence::open(directory.path().join("raft.redb"))?;
+        let observation = Arc::new(RaftBrokerObservation::new(&BrokerState::default(), None));
+        let mut state_machine =
+            AgentBrokerRaftStateMachine::load(persistence, Arc::clone(&observation)).await?;
+        let identity = CommandIdentity::new(
+            CommandSessionId::new("authority-session-must-not-own")?,
+            CommandSequence::new(1)?,
+        );
+        let key = AuthorityFenceKey::new("leader:session-boundary")?;
+        let revision_before = state_machine.broker.state().revision();
+        let proposal = ReplicatedBrokerProposalV1::identified(
+            &identity,
+            ReplicatedBrokerCommandV1::RecordAuthorityFence {
+                key: key.as_str().to_owned(),
+                revision: 7,
+                authority_id: "authority-a".to_owned(),
+                owner_instance_id: "process-a".to_owned(),
+                max_authority_fences: 4_096,
+            },
+        );
+
+        let error = match state_machine.apply_proposal(proposal) {
+            Ok(response) => {
+                return Err(format!(
+                    "generic authority fence unexpectedly accepted command-session identity: {response:?}"
+                )
+                .into());
+            }
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(state_machine.broker.state().revision(), revision_before);
+        assert!(state_machine.broker.state().authority_fence(&key).is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn authority_fence_arm_records_succeeds_and_persists_through_snapshots()
+    -> Result<(), Box<dyn Error>> {
+        use agent_broker_domain::AuthorityFenceKey;
+
+        let directory = tempdir()?;
+        let persistence = RedbRaftPersistence::open(directory.path().join("raft.redb"))?;
+        let observation = Arc::new(RaftBrokerObservation::new(&BrokerState::default(), None));
+        let mut state_machine =
+            AgentBrokerRaftStateMachine::load(persistence.clone(), Arc::clone(&observation))
+                .await?;
+        let fence_key = AuthorityFenceKey::new("leader:shard-cluster")?;
+        let revision_before = state_machine.broker.state().revision();
+
+        let record = |revision: u64, authority: &str, owner: &str| {
+            ReplicatedBrokerProposalV1::legacy(ReplicatedBrokerCommandV1::RecordAuthorityFence {
+                key: fence_key.as_str().to_owned(),
+                revision,
+                authority_id: authority.to_owned(),
+                owner_instance_id: owner.to_owned(),
+                max_authority_fences: 4_096,
+            })
+        };
+
+        let first = state_machine.apply_proposal(record(9, "authority-a", "process-a"))?;
+        let revision_after_record = state_machine.broker.state().revision();
+        assert_eq!(revision_after_record.get(), revision_before.get() + 1);
+        let recorded_revision = match &first {
+            crate::ReplicatedBrokerResponseV1::Success(
+                crate::ReplicatedBrokerMutationResultV1::AuthorityRecorded {
+                    recorded_revision,
+                    ..
+                },
+            ) => *recorded_revision,
+            other => return Err(format!("unexpected authority record response: {other:?}").into()),
+        };
+        assert_eq!(recorded_revision, 9);
+
+        // Idempotent exact replay: no new revision, identical response.
+        let replay = state_machine.apply_proposal(record(9, "authority-a", "process-a"))?;
+        assert_eq!(replay, first);
+        assert_eq!(
+            state_machine.broker.state().revision(),
+            revision_after_record
+        );
+
+        // Same authority with a different revision is a committed CONFLICT.
+        let conflict = state_machine
+            .apply_proposal(record(10, "authority-a", "process-a"))?
+            .into_application_result()?;
+        let conflict_error = match conflict {
+            Ok(result) => {
+                return Err(format!("replay binding violation succeeded: {result:?}").into());
+            }
+            Err(error) => error,
+        };
+        assert_eq!(conflict_error.code(), BrokerErrorCode::Conflict);
+        assert_eq!(
+            state_machine.broker.state().revision(),
+            revision_after_record
+        );
+
+        // A different authority succeeds only with a strictly greater revision.
+        let stale = state_machine
+            .apply_proposal(record(9, "authority-b", "process-b"))?
+            .into_application_result()?;
+        assert!(matches!(stale, Err(error) if error.code() == BrokerErrorCode::StaleFence));
+
+        let succession = state_machine
+            .apply_proposal(record(10, "authority-b", "process-b"))?
+            .into_application_result()?;
+        assert!(succession.is_ok());
+
+        // Release tombstones the key, and the floor survives a snapshot restart.
+        let release = state_machine.apply_proposal(ReplicatedBrokerProposalV1::legacy(
+            ReplicatedBrokerCommandV1::ReleaseAuthorityFence {
+                key: fence_key.as_str().to_owned(),
+                expected_revision: 10,
+                owner_instance_id: "process-b".to_owned(),
+            },
+        ))?;
+        let floor_revision = match &release {
+            crate::ReplicatedBrokerResponseV1::Success(
+                crate::ReplicatedBrokerMutationResultV1::AuthorityReleased {
+                    floor_revision, ..
+                },
+            ) => *floor_revision,
+            other => return Err(format!("unexpected authority release response: {other:?}").into()),
+        };
+        assert_eq!(floor_revision, 10);
+
+        let mut builder = state_machine.get_snapshot_builder().await;
+        let _snapshot = builder.build_snapshot().await?;
+        drop(state_machine);
+
+        let recovered_observation =
+            Arc::new(RaftBrokerObservation::new(&BrokerState::default(), None));
+        let mut recovered =
+            AgentBrokerRaftStateMachine::load(persistence, Arc::clone(&recovered_observation))
+                .await?;
+        let aba = recovered
+            .apply_proposal(record(10, "authority-b", "process-b"))?
+            .into_application_result()?;
+        assert!(matches!(aba, Err(error) if error.code() == BrokerErrorCode::StaleFence));
+        let revival = recovered
+            .apply_proposal(record(11, "authority-c", "process-c"))?
+            .into_application_result()?;
+        assert!(revival.is_ok());
         Ok(())
     }
 

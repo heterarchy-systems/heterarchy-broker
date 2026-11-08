@@ -3,13 +3,14 @@ use std::fmt;
 
 use agent_broker_application::{BrokerError, BrokerErrorCode, BrokerErrorDisposition};
 use agent_broker_domain::results::{
-    BrokerMutationResult, CompletedTasksPrunedResult, ConsumerGroupResult, HeartbeatResult,
-    MutationMetadata, NamespaceResult, StaleMembersReapedResult, TaskClaimResult,
-    TaskCompletedResult, TaskLeaseRenewedResult, TaskPublishedResult, TermAdvancedResult,
+    AuthorityRecordedResult, AuthorityReleasedResult, BrokerMutationResult,
+    CompletedTasksPrunedResult, ConsumerGroupResult, HeartbeatResult, MutationMetadata,
+    NamespaceResult, StaleMembersReapedResult, TaskClaimResult, TaskCompletedResult,
+    TaskLeaseRenewedResult, TaskPublishedResult, TermAdvancedResult,
 };
 use agent_broker_domain::{
-    ConsumerGroupId, ConsumerId, Generation, LeaseEpoch, LeaseId, NamespaceId, Revision, TaskId,
-    TaskObjective, TaskStatus, Term, TimestampMs,
+    AuthorityFenceKey, AuthorityRevision, ConsumerGroupId, ConsumerId, Generation, LeaseEpoch,
+    LeaseId, NamespaceId, Revision, TaskId, TaskObjective, TaskStatus, Term, TimestampMs,
 };
 use serde::{Deserialize, Serialize};
 
@@ -265,6 +266,16 @@ pub enum ReplicatedBrokerMutationResultV1 {
     TermAdvanced {
         metadata: ReplicatedMutationMetadataV1,
     },
+    AuthorityRecorded {
+        metadata: ReplicatedMutationMetadataV1,
+        key: String,
+        recorded_revision: u64,
+    },
+    AuthorityReleased {
+        metadata: ReplicatedMutationMetadataV1,
+        key: String,
+        floor_revision: u64,
+    },
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -391,6 +402,12 @@ impl TryFrom<BrokerMutationResult> for ReplicatedBrokerMutationResultV1 {
             BrokerMutationResult::TermAdvanced(result) => Ok(Self::TermAdvanced {
                 metadata: result.metadata.into(),
             }),
+            BrokerMutationResult::AuthorityRecorded(result) => {
+                Ok(authority_recorded_to_replicated(&result))
+            }
+            BrokerMutationResult::AuthorityReleased(result) => {
+                Ok(authority_released_to_replicated(&result))
+            }
         }
     }
 }
@@ -484,6 +501,10 @@ impl TryFrom<ReplicatedBrokerMutationResultV1> for BrokerMutationResult {
                 Ok(Self::TermAdvanced(TermAdvancedResult {
                     metadata: metadata.try_into()?,
                 }))
+            }
+            ReplicatedBrokerMutationResultV1::AuthorityRecorded { .. }
+            | ReplicatedBrokerMutationResultV1::AuthorityReleased { .. } => {
+                convert_authority_result(result)
             }
         }
     }
@@ -605,6 +626,60 @@ fn usize_to_u64(value: usize, field: &'static str) -> Result<u64, ReplicatedResp
 fn u64_to_usize(value: u64, field: &'static str) -> Result<usize, ReplicatedResponseError> {
     usize::try_from(value)
         .map_err(|_| ReplicatedResponseError(format!("{field} exceeds platform usize")))
+}
+
+fn authority_recorded_to_replicated(
+    result: &AuthorityRecordedResult,
+) -> ReplicatedBrokerMutationResultV1 {
+    ReplicatedBrokerMutationResultV1::AuthorityRecorded {
+        metadata: result.metadata.into(),
+        key: result.key.as_str().to_owned(),
+        recorded_revision: result.recorded_revision.get(),
+    }
+}
+
+fn authority_released_to_replicated(
+    result: &AuthorityReleasedResult,
+) -> ReplicatedBrokerMutationResultV1 {
+    ReplicatedBrokerMutationResultV1::AuthorityReleased {
+        metadata: result.metadata.into(),
+        key: result.key.as_str().to_owned(),
+        floor_revision: result.floor_revision.get(),
+    }
+}
+
+fn convert_authority_result(
+    result: ReplicatedBrokerMutationResultV1,
+) -> Result<BrokerMutationResult, ReplicatedResponseError> {
+    match result {
+        ReplicatedBrokerMutationResultV1::AuthorityRecorded {
+            metadata,
+            key,
+            recorded_revision,
+        } => Ok(BrokerMutationResult::AuthorityRecorded(
+            AuthorityRecordedResult {
+                metadata: metadata.try_into()?,
+                key: AuthorityFenceKey::new(key).map_err(validation_error)?,
+                recorded_revision: AuthorityRevision::new(recorded_revision)
+                    .map_err(validation_error)?,
+            },
+        )),
+        ReplicatedBrokerMutationResultV1::AuthorityReleased {
+            metadata,
+            key,
+            floor_revision,
+        } => Ok(BrokerMutationResult::AuthorityReleased(
+            AuthorityReleasedResult {
+                metadata: metadata.try_into()?,
+                key: AuthorityFenceKey::new(key).map_err(validation_error)?,
+                floor_revision: AuthorityRevision::new(floor_revision).map_err(validation_error)?,
+            },
+        )),
+        _ => Err(ReplicatedResponseError(
+            "non-authority replicated Broker response was routed to the authority converter"
+                .to_owned(),
+        )),
+    }
 }
 
 #[cfg(test)]

@@ -9,10 +9,13 @@ use agent_broker_application::{
     CommandIdentity, CommandSequence, CommandSessionId, SessionOwnerEpoch, SessionOwnerInstanceId,
 };
 use agent_broker_client::{
-    AsyncStaticClusterRouter, StaticClusterNode, StaticClusterRouterConfig,
+    AsyncStaticClusterRouter, StaticClusterNode, StaticClusterRouter, StaticClusterRouterConfig,
     StaticClusterRoutingRetryPolicy,
 };
-use agent_broker_domain::{ConsumerGroupId, NamespaceId, TaskId, TaskObjective};
+use agent_broker_domain::{
+    AuthorityFenceKey, AuthorityId, AuthorityOwnerId, AuthorityRevision, ConsumerGroupId,
+    NamespaceId, TaskId, TaskObjective,
+};
 use agent_broker_protocol::{
     BrokerRequest, EnsureConsumerGroupRequest, EnsureNamespaceRequest, PublishTaskRequest,
     RequestId, SuccessPayload,
@@ -99,7 +102,24 @@ fn build_router(
     broker_ports: [u16; 3],
     operations_ports: [u16; 3],
 ) -> Result<AsyncStaticClusterRouter, Box<dyn Error>> {
-    Ok(AsyncStaticClusterRouter::new(StaticClusterRouterConfig {
+    Ok(AsyncStaticClusterRouter::new(router_config(
+        broker_ports,
+        operations_ports,
+    ))?)
+}
+
+fn build_sync_router(
+    broker_ports: [u16; 3],
+    operations_ports: [u16; 3],
+) -> Result<StaticClusterRouter, Box<dyn Error>> {
+    Ok(StaticClusterRouter::new(router_config(
+        broker_ports,
+        operations_ports,
+    ))?)
+}
+
+fn router_config(broker_ports: [u16; 3], operations_ports: [u16; 3]) -> StaticClusterRouterConfig {
+    StaticClusterRouterConfig {
         nodes: [
             static_node(1, broker_ports[0], operations_ports[0]),
             static_node(2, broker_ports[1], operations_ports[1]),
@@ -108,7 +128,24 @@ fn build_router(
         timeout: CLIENT_TIMEOUT,
         max_response_frame_bytes: MAX_FRAME_BYTES,
         retry_policy: StaticClusterRoutingRetryPolicy::default(),
-    })?)
+    }
+}
+
+fn exercise_sync_authority_router(launch: &ClusterLaunch) -> Result<(), Box<dyn Error>> {
+    let mut router = build_sync_router(launch.broker_ports, launch.operations_ports)?;
+    let key = AuthorityFenceKey::new("leader:rust-sync-cluster-e2e")?;
+    let owner = AuthorityOwnerId::new("rust-sync-cluster-owner")?;
+    let revision = AuthorityRevision::new(3)?;
+    let recorded = router.authority_record(
+        key.clone(),
+        revision,
+        AuthorityId::new("rust-sync-cluster-authority")?,
+        owner.clone(),
+    )?;
+    assert_eq!(recorded, revision);
+    let floor = router.authority_release(key, revision, owner)?;
+    assert_eq!(floor, revision);
+    Ok(())
 }
 
 async fn run_failover_scenario(
@@ -118,6 +155,21 @@ async fn run_failover_scenario(
 ) -> Result<(), Box<dyn Error>> {
     let leader = wait_for_leader(router, children, None).await?;
     let initial_leader_id = leader.node_id;
+
+    exercise_sync_authority_router(launch)?;
+
+    let authority_key = AuthorityFenceKey::new("leader:rust-async-cluster-e2e")?;
+    let authority_owner = AuthorityOwnerId::new("rust-async-cluster-owner-a")?;
+    let initial_authority_revision = AuthorityRevision::new(7)?;
+    let recorded = router
+        .authority_record(
+            authority_key.clone(),
+            initial_authority_revision,
+            AuthorityId::new("rust-async-cluster-authority-a")?,
+            authority_owner.clone(),
+        )
+        .await?;
+    assert_eq!(recorded, initial_authority_revision);
 
     let session_id = CommandSessionId::new("rust-async-process-e2e-session")?;
     let owner_instance = SessionOwnerInstanceId::new("rust-async-process-e2e-owner")?;
@@ -146,6 +198,15 @@ async fn run_failover_scenario(
     let failover = wait_for_leader(router, children, Some(initial_leader_id)).await?;
     assert_ne!(failover.node_id, initial_leader_id);
 
+    let floor = router
+        .authority_release(
+            authority_key.clone(),
+            initial_authority_revision,
+            authority_owner,
+        )
+        .await?;
+    assert_eq!(floor, initial_authority_revision);
+
     let task_request = BrokerRequest::PublishTask(PublishTaskRequest {
         request_id: RequestId::new("rust-async-e2e-task-2")?,
         namespace_id: namespace_id.clone(),
@@ -162,6 +223,17 @@ async fn run_failover_scenario(
 
     children.insert(initial_leader_id, start_node(launch, initial_leader_id)?);
     let _recovered_leader = wait_for_leader(router, children, None).await?;
+
+    let successor_revision = AuthorityRevision::new(8)?;
+    let successor = router
+        .authority_record(
+            authority_key,
+            successor_revision,
+            AuthorityId::new("rust-async-cluster-authority-b")?,
+            AuthorityOwnerId::new("rust-async-cluster-owner-b")?,
+        )
+        .await?;
+    assert_eq!(successor, successor_revision);
 
     let group_request = BrokerRequest::EnsureConsumerGroup(EnsureConsumerGroupRequest {
         request_id: RequestId::new("rust-async-e2e-group-3")?,

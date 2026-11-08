@@ -19,28 +19,34 @@ DOCKER_CLUSTER_E2E_NODE3_OPERATIONS_PORT ?= 18833
 DOCKER_CLUSTER_E2E_ADDRESSES := 127.0.0.1:$(DOCKER_CLUSTER_E2E_NODE1_PORT) 127.0.0.1:$(DOCKER_CLUSTER_E2E_NODE2_PORT) 127.0.0.1:$(DOCKER_CLUSTER_E2E_NODE3_PORT)
 DOCKER_CLUSTER_E2E_OPERATIONS_ADDRESSES := 127.0.0.1:$(DOCKER_CLUSTER_E2E_NODE1_OPERATIONS_PORT) 127.0.0.1:$(DOCKER_CLUSTER_E2E_NODE2_OPERATIONS_PORT) 127.0.0.1:$(DOCKER_CLUSTER_E2E_NODE3_OPERATIONS_PORT)
 
-.PHONY: rust_process_e2e cutover perf_check process_e2e extended doctor ci \
+XTASK := cargo run --quiet --locked -p xtask --
+
+.PHONY: rules fmt check clippy test msrv ci deps doctor extended perf \
+	rust_process_e2e cutover perf_check process_e2e broker_ci broker_doctor \
 	docker_build docker_compose_config docker_up docker_down docker_cluster_config \
 	docker_cluster_up docker_cluster_down docker_cluster_smoke docker_cluster_failover_probe \
 	docker_cluster_rejoin_probe docker_cluster_stop_node1 docker_cluster_recreate_node1 \
 	docker_cluster_e2e docker_builder docker_multiarch_check docker_hub_push
 
+rules fmt check clippy test msrv ci deps doctor extended perf:
+	$(XTASK) $@
+
 rust_process_e2e:
 	cargo test -p agent-broker-runtime --test process_restart_e2e -- --nocapture
 	cargo test -p agent-broker-runtime --test tcp_runtime_e2e -- --nocapture
 
-cutover:
-	cargo xtask cutover
+cutover: broker_ci perf_check
 
 perf_check:
-	cargo xtask perf
+	cargo test --release -p agent-broker-consensus snapshot_binary_transfer_peak_rss_is_bounded -- --ignored --nocapture --test-threads=1
+	cargo build --release -p agent-broker-runtime --example perf_probe
+	cargo run --release -p agent-broker-runtime --example perf_probe
 
 process_e2e: rust_process_e2e
 
-extended:
-	cargo xtask extended
+broker_ci: ci clippy rust_process_e2e
 
-doctor:
+broker_doctor:
 	cargo run -p agent-broker-runtime --bin agentbrokerd -- doctor --nodes 1
 	cargo run -p agent-broker-runtime --bin agentbrokerd -- doctor --nodes 3
 
@@ -236,5 +242,3 @@ docker_hub_push: docker_builder
 		--provenance=mode=max \
 		--sbom=true \
 		--push .
-
-ci: cutover rust_process_e2e

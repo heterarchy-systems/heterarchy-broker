@@ -20,6 +20,33 @@ from agent_broker import (
 )
 
 
+def _cargo_target_directory(repo: Path) -> Path:
+    configured_target = os.environ.get("CARGO_TARGET_DIR")
+    target_dir = Path(configured_target) if configured_target else repo / "target"
+    if not target_dir.is_absolute():
+        target_dir = repo / target_dir
+    return target_dir.resolve()
+
+
+def _rust_debug_artifact(repo: Path, *parts: str) -> Path:
+    artifact = _cargo_target_directory(repo) / "debug" / Path(*parts)
+    if os.name == "nt" and artifact.suffix.lower() != ".exe":
+        artifact = artifact.with_name(f"{artifact.name}.exe")
+    return artifact.resolve()
+
+
+def _agent_brokerd_binary(repo: Path) -> Path:
+    configured_binary = os.environ.get("AGENT_BROKERD_BIN")
+    if configured_binary:
+        binary = Path(configured_binary)
+        if not binary.is_absolute():
+            binary = repo / binary
+        if os.name == "nt" and binary.suffix.lower() != ".exe":
+            binary = binary.with_name(f"{binary.name}.exe")
+        return binary.resolve()
+    return _rust_debug_artifact(repo, "agentbrokerd")
+
+
 def _reserve_loopback_ports(count: int) -> tuple[int, ...]:
     reservations = [
         socket.socket(socket.AF_INET, socket.SOCK_STREAM) for _ in range(count)
@@ -51,7 +78,7 @@ async def _stop_process(process: asyncio.subprocess.Process) -> None:
 class AsyncRustStandaloneIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_health_mutation_and_restart_recovery(self) -> None:
         repo = Path(__file__).resolve().parents[3]
-        binary = repo / "target" / "debug" / "agentbrokerd"
+        binary = _agent_brokerd_binary(repo)
         self.assertTrue(binary.is_file(), f"prebuilt Rust Broker is missing: {binary}")
         port, operations_port = _reserve_loopback_ports(2)
 
@@ -141,8 +168,8 @@ class AsyncRustStandaloneIntegrationTests(unittest.IsolatedAsyncioTestCase):
 class AsyncRustClusterIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_leader_failover_restart_and_full_owner_aware_lifecycle(self) -> None:
         repo = Path(__file__).resolve().parents[3]
-        binary = repo / "target" / "debug" / "agentbrokerd"
-        tls_generator = repo / "target" / "debug" / "examples" / "generate_cluster_tls"
+        binary = _agent_brokerd_binary(repo)
+        tls_generator = _rust_debug_artifact(repo, "examples", "generate_cluster_tls")
         self.assertTrue(binary.is_file(), f"prebuilt Rust Broker is missing: {binary}")
         self.assertTrue(
             tls_generator.is_file(),

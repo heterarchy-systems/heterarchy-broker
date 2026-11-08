@@ -2,8 +2,9 @@ use std::error::Error;
 use std::fmt;
 
 use crate::{
-    Capabilities, ConsumerGroupId, ConsumerId, Generation, LeaseEpoch, LeaseId, NamespaceId,
-    Revision, TaskId, TaskObjective, TaskResult, Term, TimestampMs,
+    AuthorityFence, AuthorityFenceKey, Capabilities, ConsumerGroupId, ConsumerId, Generation,
+    LeaseEpoch, LeaseId, NamespaceId, Revision, TaskId, TaskObjective, TaskResult, Term,
+    TimestampMs,
 };
 
 /// Durable logical Broker image independent of any storage encoding.
@@ -17,6 +18,17 @@ pub struct BrokerCheckpoint {
     pub namespaces: Vec<NamespaceCheckpoint>,
     pub tasks: Vec<TaskCheckpoint>,
     pub groups: Vec<ConsumerGroupCheckpoint>,
+    /// Generic authority fence records; additive field defaulting to empty for older images.
+    pub authority_fences: Vec<AuthorityFenceCheckpoint>,
+}
+
+/// Authority fence record carried by a logical Broker checkpoint.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct AuthorityFenceCheckpoint {
+    /// Bounded fence key.
+    pub key: AuthorityFenceKey,
+    /// Live record or released tombstone with its retained floor revision.
+    pub fence: AuthorityFence,
 }
 
 /// Namespace record carried by a logical Broker checkpoint.
@@ -93,6 +105,7 @@ pub enum CheckpointError {
     DuplicateConsumerGroup(ConsumerGroupId),
     DuplicateMember(ConsumerId),
     DuplicateActiveLease(LeaseId),
+    DuplicateAuthorityFence(AuthorityFenceKey),
     UnknownNamespace {
         entity: &'static str,
         namespace_id: NamespaceId,
@@ -115,6 +128,9 @@ impl fmt::Display for CheckpointError {
             Self::DuplicateMember(id) => write!(formatter, "duplicate member {id} in checkpoint"),
             Self::DuplicateActiveLease(id) => {
                 write!(formatter, "duplicate active lease {id} in checkpoint")
+            }
+            Self::DuplicateAuthorityFence(key) => {
+                write!(formatter, "duplicate authority fence {key} in checkpoint")
             }
             Self::UnknownNamespace {
                 entity,

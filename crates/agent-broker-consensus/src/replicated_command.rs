@@ -5,11 +5,13 @@ use agent_broker_domain::commands::{
     AdvanceTermCommand, BrokerCommand, ClaimTaskCommand, CompleteTaskCommand,
     EnsureConsumerGroupCommand, EnsureNamespaceCommand, HeartbeatCommand, JoinConsumerGroupCommand,
     LeaveConsumerGroupCommand, PruneCompletedTasksCommand, PublishTaskCommand,
-    ReapStaleMembersCommand, RenewTaskLeaseCommand,
+    ReapStaleMembersCommand, RecordAuthorityFenceCommand, ReleaseAuthorityFenceCommand,
+    RenewTaskLeaseCommand,
 };
 use agent_broker_domain::{
-    Capabilities, ConsumerGroupId, ConsumerId, Generation, LeaseEpoch, LeaseId, NamespaceId,
-    TaskId, TaskObjective, TaskResult, Term, TimestampMs,
+    AuthorityFenceKey, AuthorityId, AuthorityOwnerId, AuthorityRevision, Capabilities,
+    ConsumerGroupId, ConsumerId, Generation, LeaseEpoch, LeaseId, NamespaceId, TaskId,
+    TaskObjective, TaskResult, Term, TimestampMs,
 };
 use serde::{Deserialize, Serialize};
 
@@ -103,6 +105,18 @@ pub enum ReplicatedBrokerCommandV1 {
         expected_owner_epoch: u64,
         owner_instance_id: String,
     },
+    RecordAuthorityFence {
+        key: String,
+        revision: u64,
+        authority_id: String,
+        owner_instance_id: String,
+        max_authority_fences: u64,
+    },
+    ReleaseAuthorityFence {
+        key: String,
+        expected_revision: u64,
+        owner_instance_id: String,
+    },
 }
 
 impl ReplicatedBrokerCommandV1 {
@@ -192,7 +206,9 @@ impl ReplicatedBrokerCommandV1 {
             | (Self::ReapStaleMembers { .. }, Self::ReapStaleMembers { .. })
             | (Self::PruneCompletedTasks { .. }, Self::PruneCompletedTasks { .. })
             | (Self::AdvanceTerm { .. }, Self::AdvanceTerm { .. })
-            | (Self::AcquireCommandSessionOwner { .. }, Self::AcquireCommandSessionOwner { .. }) => {
+            | (Self::AcquireCommandSessionOwner { .. }, Self::AcquireCommandSessionOwner { .. })
+            | (Self::RecordAuthorityFence { .. }, Self::RecordAuthorityFence { .. })
+            | (Self::ReleaseAuthorityFence { .. }, Self::ReleaseAuthorityFence { .. }) => {
                 self == other
             }
             (Self::ClaimTask { .. }, Self::ClaimTask { .. }) => same_claim_request(self, other),
@@ -411,7 +427,35 @@ impl TryFrom<BrokerCommand> for ReplicatedBrokerCommandV1 {
                 expected_term: command.expected_term.get(),
                 new_term: command.new_term.get(),
             }),
+            BrokerCommand::RecordAuthorityFence(command) => {
+                record_authority_command_to_replicated(&command)
+            }
+            BrokerCommand::ReleaseAuthorityFence(command) => {
+                Ok(release_authority_command_to_replicated(&command))
+            }
         }
+    }
+}
+
+fn record_authority_command_to_replicated(
+    command: &RecordAuthorityFenceCommand,
+) -> Result<ReplicatedBrokerCommandV1, ReplicatedCommandError> {
+    Ok(ReplicatedBrokerCommandV1::RecordAuthorityFence {
+        key: command.key.as_str().to_owned(),
+        revision: command.revision.get(),
+        authority_id: command.authority_id.as_str().to_owned(),
+        owner_instance_id: command.owner_instance_id.as_str().to_owned(),
+        max_authority_fences: usize_to_u64(command.max_authority_fences, "max_authority_fences")?,
+    })
+}
+
+fn release_authority_command_to_replicated(
+    command: &ReleaseAuthorityFenceCommand,
+) -> ReplicatedBrokerCommandV1 {
+    ReplicatedBrokerCommandV1::ReleaseAuthorityFence {
+        key: command.key.as_str().to_owned(),
+        expected_revision: command.expected_revision.get(),
+        owner_instance_id: command.owner_instance_id.as_str().to_owned(),
     }
 }
 
@@ -502,6 +546,10 @@ impl TryFrom<ReplicatedBrokerCommandV1> for BrokerCommand {
                 expected_term: Term::new(expected_term).map_err(validation_error)?,
                 new_term: Term::new(new_term).map_err(validation_error)?,
             })),
+            command @ (ReplicatedBrokerCommandV1::RecordAuthorityFence { .. }
+            | ReplicatedBrokerCommandV1::ReleaseAuthorityFence { .. }) => {
+                convert_authority_command(command)
+            }
             ReplicatedBrokerCommandV1::AcquireCommandSessionOwner { .. } => {
                 Err(ReplicatedCommandError(
                     "command-session owner acquisition is consensus-owned and cannot become a Broker domain command"
@@ -626,6 +674,46 @@ fn usize_to_u64(value: usize, field: &'static str) -> Result<u64, ReplicatedComm
 fn u64_to_usize(value: u64, field: &'static str) -> Result<usize, ReplicatedCommandError> {
     usize::try_from(value)
         .map_err(|_| ReplicatedCommandError(format!("{field} exceeds platform usize")))
+}
+
+fn convert_authority_command(
+    command: ReplicatedBrokerCommandV1,
+) -> Result<BrokerCommand, ReplicatedCommandError> {
+    match command {
+        ReplicatedBrokerCommandV1::RecordAuthorityFence {
+            key,
+            revision,
+            authority_id,
+            owner_instance_id,
+            max_authority_fences,
+        } => Ok(BrokerCommand::RecordAuthorityFence(
+            RecordAuthorityFenceCommand {
+                key: AuthorityFenceKey::new(key).map_err(validation_error)?,
+                revision: AuthorityRevision::new(revision).map_err(validation_error)?,
+                authority_id: AuthorityId::new(authority_id).map_err(validation_error)?,
+                owner_instance_id: AuthorityOwnerId::new(owner_instance_id)
+                    .map_err(validation_error)?,
+                max_authority_fences: u64_to_usize(max_authority_fences, "max_authority_fences")?,
+            },
+        )),
+        ReplicatedBrokerCommandV1::ReleaseAuthorityFence {
+            key,
+            expected_revision,
+            owner_instance_id,
+        } => Ok(BrokerCommand::ReleaseAuthorityFence(
+            ReleaseAuthorityFenceCommand {
+                key: AuthorityFenceKey::new(key).map_err(validation_error)?,
+                expected_revision: AuthorityRevision::new(expected_revision)
+                    .map_err(validation_error)?,
+                owner_instance_id: AuthorityOwnerId::new(owner_instance_id)
+                    .map_err(validation_error)?,
+            },
+        )),
+        _ => Err(ReplicatedCommandError(
+            "non-authority replicated Broker command was routed to the authority converter"
+                .to_owned(),
+        )),
+    }
 }
 
 #[cfg(test)]

@@ -1,892 +1,1223 @@
 use std::collections::BTreeSet;
-use std::env;
-use std::error::Error;
-use std::fmt;
+use std::ffi::OsStr;
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::path::{Component, Path, PathBuf};
+use std::process::{Command, ExitStatus};
 
-const REQUIRED_RULES: [&str; 18] = [
+const NORMAL_RULES: &[&str] = &[
+    "README.md",
     "00-overview.md",
-    "01-project-boundary.md",
+    "01-boundary.md",
     "02-workspace-crate-rules.md",
-    "03-naming-api-rules.md",
-    "04-type-domain-modeling-rules.md",
-    "05-ownership-borrowing-rules.md",
-    "06-error-panic-rules.md",
-    "07-concurrency-sync-rules.md",
-    "08-async-tokio-rules.md",
-    "09-state-machine-rules.md",
-    "10-persistence-wal-snapshot-rules.md",
-    "11-network-protocol-rules.md",
-    "12-consensus-raft-rules.md",
-    "13-safety-unsafe-ffi-rules.md",
-    "14-dependency-supply-chain-rules.md",
-    "15-testing-verification-rules.md",
-    "16-performance-memory-rules.md",
-    "17-observability-operations-rules.md",
+    "03-deterministic-state-machine-rules.md",
+    "04-ffi-interop-boundary-rules.md",
+    "05-error-panic-rules.md",
+    "06-testing-verification-rules.md",
+    "07-performance-memory-rules.md",
+    "08-observability-operations-rules.md",
+    "09-module-layout-rules.md",
 ];
 
-const REQUIRED_SKILLS: [(&str, &str); 2] = [
-    (
-        ".agents/rust_dev_rules/skills/rust-production-engineering/SKILL.md",
-        "name: rust-production-engineering",
-    ),
-    (
-        ".agents/rust_dev_rules/skills/rust-distributed-broker/SKILL.md",
-        "name: rust-distributed-broker",
-    ),
+const TYPE_RULES: &[&str] = &[
+    "README.md",
+    "01-domain-newtype-invariant-rules.md",
+    "02-enum-state-sum-type-rules.md",
+    "03-option-result-outcome-rules.md",
+    "04-trait-generic-bound-rules.md",
+    "05-ownership-borrow-lifetime-rules.md",
+    "06-smart-pointer-interior-mutability-rules.md",
+    "07-send-sync-thread-safety-type-rules.md",
+    "08-conversion-parsing-cast-rules.md",
+    "09-public-api-type-evolution-rules.md",
+    "10-unsafe-type-invariant-rules.md",
 ];
 
-#[derive(Debug)]
-struct HarnessError(String);
+const ASYNC_RULES: &[&str] = &[
+    "README.md",
+    "01-execution-model-runtime-rules.md",
+    "02-task-ownership-structured-concurrency-rules.md",
+    "03-cancellation-timeout-select-rules.md",
+    "04-bounded-concurrency-backpressure-rules.md",
+    "05-shared-state-lock-channel-rules.md",
+    "06-blocking-cpu-parallelism-rules.md",
+    "07-send-sync-local-task-rules.md",
+    "08-async-error-shutdown-rules.md",
+    "09-async-testing-verification-rules.md",
+    "10-async-observability-performance-rules.md",
+];
 
-impl fmt::Display for HarnessError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
-    }
+const REQUIRED_SHARED: &[&str] = &[
+    "shared/authority.md",
+    "shared/testing.md",
+    "shared/agent-execution.md",
+    "shared/solution-minimality.md",
+];
+
+const REQUIRED_SKILLS: &[&str] = &[
+    "skills/rust-engineering/SKILL.md",
+    "skills/minimal-engineering/SKILL.md",
+];
+
+const CHECK_ARGS: &[&str] = &["check", "--locked", "--workspace", "--all-targets"];
+const CLIPPY_ARGS: &[&str] = &["clippy", "--locked", "--workspace", "--all-targets"];
+const TEST_ARGS: &[&str] = &["test", "--locked", "--workspace", "--all-targets"];
+const DOC_TEST_ARGS: &[&str] = &["test", "--locked", "--workspace", "--doc"];
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ToolchainPolicy {
+    channel: String,
 }
 
-impl Error for HarnessError {}
+impl ToolchainPolicy {
+    fn load(root: &Path) -> Result<Self, String> {
+        let path = root.join("rust-toolchain.toml");
+        let manifest = read_toml(&path)?;
+        let channel = required_str(required_table(&manifest, "toolchain")?, "channel")?;
+        Ok(Self {
+            channel: channel.to_owned(),
+        })
+    }
 
-type HarnessResult<T> = Result<T, Box<dyn Error>>;
+    fn command(&self, program: &str) -> Command {
+        let mut command = Command::new("rustup");
+        command.args(["run", &self.channel, program]);
+        command
+    }
 
-fn main() -> ExitCode {
-    match run() {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
-            eprintln!("xtask failed: {error}");
-            ExitCode::FAILURE
+    fn cargo_family_command(&self, program: &str) -> Result<Command, String> {
+        let rustc = self.tool_path("rustc")?;
+        let rustdoc = self.tool_path("rustdoc")?;
+        let mut command = self.command(program);
+        command.env("RUSTC", rustc).env("RUSTDOC", rustdoc);
+        Ok(command)
+    }
+
+    fn tool_path(&self, program: &str) -> Result<PathBuf, String> {
+        let mut command = Command::new("rustup");
+        command.args(["which", "--toolchain", &self.channel, program]);
+        let path = output_line(
+            &mut command,
+            &format!("rustup which --toolchain {} {program}", self.channel),
+        )?;
+        let path = PathBuf::from(path);
+        if !path.is_absolute() {
+            return Err(format!(
+                "declared toolchain returned a non-absolute {program} path"
+            ));
         }
+        Ok(path)
     }
 }
 
-fn run() -> HarnessResult<()> {
-    let command = env::args().nth(1).unwrap_or_else(|| "help".to_owned());
-    let root = workspace_root()?;
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PublicPolicy {
+    crate_name: String,
+    msrv: String,
+}
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct HarnessPolicy {
+    workspace_msrv: String,
+    public_policy: Option<PublicPolicy>,
+    supply_chain: bool,
+}
+
+impl HarnessPolicy {
+    fn load(root: &Path) -> Result<Self, String> {
+        let path = harness_root(root).join("HARNESS.toml");
+        let config = read_toml(&path)?;
+        let toolchain = required_table(&config, "toolchain")?;
+        if required_str(toolchain, "policy")? != "msrv" {
+            return Err("toolchain.policy must be \"msrv\"".to_owned());
+        }
+        let workspace_msrv = required_str(toolchain, "msrv")?.to_owned();
+
+        // A public policy crate is optional: repositories without a
+        // separately-versioned public contract omit [public_policy] and the
+        // pinned workspace toolchain is the only MSRV authority.
+        let public_policy = match config.get("public_policy") {
+            Some(public) => {
+                let public = public
+                    .as_table()
+                    .ok_or_else(|| "missing [public_policy] table".to_owned())?;
+                let public_policy = PublicPolicy {
+                    crate_name: required_str(public, "crate")?.to_owned(),
+                    msrv: required_str(public, "msrv")?.to_owned(),
+                };
+                if required_str(public, "verification")? != "direct-cargo-with-rust-1.92" {
+                    return Err(
+                        "public_policy.verification must be direct-cargo-with-rust-1.92".to_owned(),
+                    );
+                }
+                Some(public_policy)
+            }
+            None => None,
+        };
+
+        let supply_chain = required_bool(required_table(&config, "verification")?, "supply_chain")?;
+        let unsafe_policy = required_table(&config, "unsafe")?;
+        if required_str(unsafe_policy, "mode")? != "forbid" {
+            return Err("unsafe.mode must be \"forbid\" for this repository".to_owned());
+        }
+        let approved = required_array(unsafe_policy, "approved_crates")?;
+        if !approved.is_empty() {
+            return Err("unsafe.approved_crates must be empty when unsafe.mode=forbid".to_owned());
+        }
+
+        Ok(Self {
+            workspace_msrv,
+            public_policy,
+            supply_chain,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum XtaskCommand {
+    Rules,
+    Fmt,
+    Check,
+    Clippy,
+    Test,
+    Msrv,
+    Ci,
+    Deps,
+    Doctor,
+    Extended,
+    Perf,
+    Help,
+}
+
+fn parse_command<I, S>(args: I) -> Result<XtaskCommand, String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut args = args.into_iter();
+    let command = args.next().map_or_else(
+        || "help".to_owned(),
+        |value| value.as_ref().to_string_lossy().into_owned(),
+    );
+    if let Some(extra) = args.next() {
+        return Err(format!(
+            "unexpected argument after {command:?}: {}",
+            extra.as_ref().to_string_lossy()
+        ));
+    }
     match command.as_str() {
-        "rules" => verify_rules(&root),
-        "check" => run_check(&root),
-        "test" => run_tests(&root),
-        "ci" => run_ci(&root),
-        "cutover" => run_cutover_checks(&root),
-        "extended" => run_extended_checks(&root),
-        "perf" => run_performance_checks(&root),
-        "doctor" => run_doctor(&root),
-        "deps" => run_dependency_checks(&root),
-        "help" | "--help" | "-h" => {
-            print_help();
+        "rules" => Ok(XtaskCommand::Rules),
+        "fmt" => Ok(XtaskCommand::Fmt),
+        "check" => Ok(XtaskCommand::Check),
+        "clippy" => Ok(XtaskCommand::Clippy),
+        "test" => Ok(XtaskCommand::Test),
+        "msrv" => Ok(XtaskCommand::Msrv),
+        "ci" => Ok(XtaskCommand::Ci),
+        "deps" => Ok(XtaskCommand::Deps),
+        "doctor" => Ok(XtaskCommand::Doctor),
+        "extended" => Ok(XtaskCommand::Extended),
+        "perf" => Ok(XtaskCommand::Perf),
+        "help" | "-h" | "--help" => Ok(XtaskCommand::Help),
+        other => Err(format!("unknown xtask command: {other}")),
+    }
+}
+
+fn main() {
+    let result = parse_command(std::env::args_os().skip(1)).and_then(run);
+    if let Err(error) = result {
+        eprintln!("xtask: {error}");
+        std::process::exit(1);
+    }
+}
+
+fn run(command: XtaskCommand) -> Result<(), String> {
+    match command {
+        XtaskCommand::Rules => rules(),
+        XtaskCommand::Fmt => fmt(),
+        XtaskCommand::Check => check(),
+        XtaskCommand::Clippy => clippy(),
+        XtaskCommand::Test => test(),
+        XtaskCommand::Msrv => msrv(),
+        XtaskCommand::Ci => ci(),
+        XtaskCommand::Deps => deps(),
+        XtaskCommand::Doctor => doctor(),
+        XtaskCommand::Extended => extended(),
+        XtaskCommand::Perf => perf(),
+        XtaskCommand::Help => {
+            help();
             Ok(())
         }
-        other => Err(HarnessError(format!(
-            "unknown xtask command {other:?}; run `cargo xtask help`"
-        ))
-        .into()),
     }
 }
 
-fn workspace_root() -> HarnessResult<PathBuf> {
-    let mut candidate = env::current_dir()?;
-    loop {
-        let cargo_toml = candidate.join("Cargo.toml");
-        let xtask_manifest = candidate.join("xtask/Cargo.toml");
-        if cargo_toml.is_file() && xtask_manifest.is_file() {
-            let cargo_toml = fs::read_to_string(&cargo_toml)?;
-            if cargo_toml.contains("[workspace]") {
-                return Ok(candidate);
+fn help() {
+    println!("cargo xtask <rules|fmt|check|clippy|test|msrv|ci|deps|doctor|extended|perf>");
+}
+
+fn workspace_root() -> Result<PathBuf, String> {
+    let runtime_manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR");
+    let cwd = std::env::current_dir()
+        .map_err(|error| format!("failed to read current working directory: {error}"))?;
+    workspace_root_from(runtime_manifest_dir.as_deref(), &cwd)
+}
+
+fn workspace_root_from(
+    runtime_manifest_dir: Option<&OsStr>,
+    cwd: &Path,
+) -> Result<PathBuf, String> {
+    if let Some(runtime_manifest_dir) = runtime_manifest_dir {
+        return find_workspace_root(Path::new(runtime_manifest_dir));
+    }
+    find_workspace_root(cwd)
+}
+
+fn find_workspace_root(start: &Path) -> Result<PathBuf, String> {
+    for ancestor in start.ancestors() {
+        let path = ancestor.join("Cargo.toml");
+        if path.is_file() && read_toml(&path)?.get("workspace").is_some() {
+            return ancestor.canonicalize().map_err(|error| {
+                format!(
+                    "failed to canonicalize Cargo workspace root {}: {error}",
+                    ancestor.display()
+                )
+            });
+        }
+    }
+    Err(format!(
+        "could not locate Cargo workspace root from {}",
+        start.display()
+    ))
+}
+
+fn harness_root(root: &Path) -> PathBuf {
+    root.join(".agents").join("rust_dev_harness")
+}
+
+fn read_toml(path: &Path) -> Result<toml::Value, String> {
+    let source = fs::read_to_string(path)
+        .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+    toml::from_str(&source).map_err(|error| format!("invalid TOML {}: {error}", path.display()))
+}
+
+fn required_table<'a>(
+    value: &'a toml::Value,
+    name: &str,
+) -> Result<&'a toml::value::Table, String> {
+    value
+        .get(name)
+        .and_then(toml::Value::as_table)
+        .ok_or_else(|| format!("missing [{name}] table"))
+}
+
+fn required_str<'a>(table: &'a toml::value::Table, name: &str) -> Result<&'a str, String> {
+    table
+        .get(name)
+        .and_then(toml::Value::as_str)
+        .ok_or_else(|| format!("missing/non-string field {name}"))
+}
+
+fn required_bool(table: &toml::value::Table, name: &str) -> Result<bool, String> {
+    table
+        .get(name)
+        .and_then(toml::Value::as_bool)
+        .ok_or_else(|| format!("missing/non-boolean field {name}"))
+}
+
+fn required_array<'a>(
+    table: &'a toml::value::Table,
+    name: &str,
+) -> Result<&'a Vec<toml::Value>, String> {
+    table
+        .get(name)
+        .and_then(toml::Value::as_array)
+        .ok_or_else(|| format!("missing/non-array field {name}"))
+}
+
+fn require_file(path: &Path) -> Result<(), String> {
+    if path.is_file() {
+        Ok(())
+    } else {
+        Err(format!("missing required file: {}", path.display()))
+    }
+}
+
+fn verify_group(root: &Path, directory: &str, files: &[&str]) -> Result<(), String> {
+    let directory = root.join("rules").join(directory);
+    for file in files {
+        require_file(&directory.join(file))?;
+    }
+    Ok(())
+}
+
+fn rules() -> Result<(), String> {
+    let root = workspace_root()?;
+    let harness = harness_root(&root);
+    let toolchain = ToolchainPolicy::load(&root)?;
+
+    require_file(&root.join("AGENTS.md"))?;
+    // The `.agents/` harness bundle is local operator material and is never
+    // pushed (the Alexandria CI pattern). Fresh checkouts verify the tracked
+    // gates only; an operator machine that materialized the bundle gets the
+    // full bundle verification on top.
+    let policy = if harness.is_dir() {
+        let policy = HarnessPolicy::load(&root)?;
+        for required in [
+            "PROJECT_PROFILE.md",
+            "HARNESS.toml",
+            "HARNESS_MANIFEST.toml",
+        ] {
+            require_file(&harness.join(required))?;
+        }
+        for required in REQUIRED_SHARED.iter().chain(REQUIRED_SKILLS) {
+            require_file(&harness.join(required))?;
+        }
+        verify_group(&harness, "normal_dev_rules", NORMAL_RULES)?;
+        verify_group(&harness, "type_dev_rules", TYPE_RULES)?;
+        verify_group(&harness, "async_dev_rules", ASYNC_RULES)?;
+        verify_manifest(&harness)?;
+        verify_sources_inventory(&harness)?;
+        policy
+    } else {
+        let workspace_msrv = workspace_msrv(&root)?;
+        println!(
+            "harness bundle not materialized; verifying tracked gates only (workspace MSRV {workspace_msrv})"
+        );
+        HarnessPolicy {
+            workspace_msrv,
+            public_policy: None,
+            supply_chain: false,
+        }
+    };
+    verify_declared_toolchain_available(&root, &toolchain)?;
+    verify_cargo_baseline(&root, &policy)?;
+    verify_removed_packages_absent(&root)?;
+    verify_workspace_members(&root, &toolchain, &policy)?;
+    println!("xtask rules: PASS");
+    Ok(())
+}
+
+fn workspace_msrv(root: &Path) -> Result<String, String> {
+    let manifest = read_toml(&root.join("Cargo.toml"))?;
+    let workspace = required_table(&manifest, "workspace")?;
+    let package = workspace
+        .get("package")
+        .and_then(toml::Value::as_table)
+        .ok_or_else(|| "root Cargo.toml must define [workspace.package]".to_owned())?;
+    package
+        .get("rust-version")
+        .and_then(toml::Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| "workspace.package.rust-version is required".to_owned())
+}
+
+fn verify_manifest(harness: &Path) -> Result<(), String> {
+    let manifest = read_toml(&harness.join("HARNESS_MANIFEST.toml"))?;
+    if manifest
+        .get("schema_version")
+        .and_then(toml::Value::as_integer)
+        != Some(1)
+    {
+        return Err("HARNESS_MANIFEST.toml schema_version must be 1".to_owned());
+    }
+    for (key, expected) in [
+        ("family", "engineering"),
+        ("package", "Rust_package"),
+        ("language", "rust"),
+    ] {
+        if manifest.get(key).and_then(toml::Value::as_str) != Some(expected) {
+            return Err(format!("HARNESS_MANIFEST.toml {key} must be {expected:?}"));
+        }
+    }
+    let identity = required_table(&manifest, "identity")?;
+    if required_str(identity, "source")? != "Alexandria" {
+        return Err("HARNESS_MANIFEST.toml identity.source must be Alexandria".to_owned());
+    }
+    let source_path = required_str(identity, "source_path")?;
+    if source_path != "Jobs/Harness/Engineering Harness/02 Rust/" {
+        return Err(
+            "HARNESS_MANIFEST.toml identity.source_path is not the canonical Rust Harness path"
+                .to_owned(),
+        );
+    }
+
+    let contracts = required_table(&manifest, "contracts")?;
+    verify_ref(harness, contracts, "project_profile", "PROJECT_PROFILE.md")?;
+    verify_ref(harness, contracts, "machine_config", "HARNESS.toml")?;
+    verify_ref(harness, contracts, "rules_router", "rules/README.md")?;
+
+    let harness_refs = required_table(&manifest, "harness")?;
+    verify_ref(harness, harness_refs, "xtask", "harness/xtask/Cargo.toml")?;
+    verify_ref(harness, harness_refs, "sources", "SOURCES.json")?;
+
+    verify_string_array(
+        required_table(&manifest, "shared")?,
+        "contracts",
+        &[
+            "authority",
+            "testing",
+            "agent-execution",
+            "solution-minimality",
+        ],
+    )?;
+    verify_string_array(
+        required_table(&manifest, "shared")?,
+        "skills",
+        &["minimal-engineering"],
+    )?;
+    verify_string_array(
+        required_table(&manifest, "activation")?,
+        "baseline",
+        &["normal", "type"],
+    )?;
+    verify_string_array(
+        required_table(&manifest, "activation")?,
+        "optional",
+        &["async"],
+    )?;
+    verify_string_array(
+        required_table(&manifest, "skills")?,
+        "entries",
+        REQUIRED_SKILLS,
+    )?;
+    for skill in REQUIRED_SKILLS {
+        require_file(&harness.join(skill))?;
+    }
+    verify_string_array(
+        required_table(&manifest, "verification")?,
+        "entrypoints",
+        &["make rules", "make ci", "make doctor", "make extended"],
+    )?;
+    if required_str(
+        required_table(&manifest, "provenance")?,
+        "manifest_hash_algorithm",
+    )? != "sha256"
+    {
+        return Err("provenance.manifest_hash_algorithm must be sha256".to_owned());
+    }
+    Ok(())
+}
+
+fn verify_ref(
+    harness: &Path,
+    table: &toml::value::Table,
+    key: &str,
+    expected: &str,
+) -> Result<(), String> {
+    if required_str(table, key)? != expected {
+        return Err(format!("manifest {key} reference must be {expected:?}"));
+    }
+    require_file(&harness.join(expected))
+}
+
+fn verify_string_array(
+    table: &toml::value::Table,
+    key: &str,
+    expected: &[&str],
+) -> Result<(), String> {
+    let actual = required_array(table, key)?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or_else(|| format!("{key} entries must be strings"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(format!(
+            "manifest {key} must be {expected:?}, found {actual:?}"
+        ))
+    }
+}
+
+fn verify_sources_inventory(harness: &Path) -> Result<(), String> {
+    let path = harness.join("SOURCES.json");
+    let bytes =
+        fs::read(&path).map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+    let inventory: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("invalid JSON {}: {error}", path.display()))?;
+    if inventory
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        != Some(1)
+    {
+        return Err("SOURCES.json schema_version must be 1".to_owned());
+    }
+    for key in ["retrieved_at", "materialization"] {
+        if inventory
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .is_none()
+        {
+            return Err(format!("SOURCES.json {key} must be a string"));
+        }
+    }
+    let sources = inventory
+        .get("sources")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "SOURCES.json sources must be an array".to_owned())?;
+    if sources.is_empty() {
+        return Err("SOURCES.json sources must not be empty".to_owned());
+    }
+    let mut seen = BTreeSet::new();
+    for source in sources {
+        let relative = source
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "SOURCES.json source.path must be a string".to_owned())?;
+        let relative_path = Path::new(relative);
+        if relative_path.is_absolute()
+            || relative_path.components().any(|component| {
+                matches!(
+                    component,
+                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                )
+            })
+        {
+            return Err(format!(
+                "SOURCES.json source.path is not confined: {relative:?}"
+            ));
+        }
+        if !seen.insert(relative.to_owned()) {
+            return Err(format!(
+                "SOURCES.json contains duplicate path: {relative:?}"
+            ));
+        }
+        let candidate = harness.join(relative_path);
+        require_file(&candidate)?;
+        let canonical_harness = harness
+            .canonicalize()
+            .map_err(|error| format!("failed to canonicalize {}: {error}", harness.display()))?;
+        let canonical_candidate = candidate
+            .canonicalize()
+            .map_err(|error| format!("failed to canonicalize {}: {error}", candidate.display()))?;
+        if !canonical_candidate.starts_with(&canonical_harness) {
+            return Err(format!(
+                "SOURCES.json source.path escapes through a symlink: {relative:?}"
+            ));
+        }
+        for key in ["source_path", "note_id", "modified_at"] {
+            if source
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .is_none()
+            {
+                return Err(format!(
+                    "SOURCES.json {relative:?} field {key} must be a string"
+                ));
             }
         }
-        if !candidate.pop() {
-            break;
-        }
-    }
-    Err(HarnessError(
-        "xtask workspace root could not be resolved from the current directory".to_owned(),
-    )
-    .into())
-}
-
-fn verify_rules(root: &Path) -> HarnessResult<()> {
-    let rules_dir = root.join(".agents/rust_dev_rules/rules");
-    let mut actual_markdown = BTreeSet::new();
-
-    for entry in fs::read_dir(&rules_dir)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_file() {
-            continue;
-        }
-        let file_name = entry.file_name();
-        let Some(file_name) = file_name.to_str() else {
-            return Err(HarnessError("rule filename is not valid UTF-8".to_owned()).into());
-        };
-        if Path::new(file_name)
-            .extension()
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("md"))
+        if source
+            .get("version")
+            .and_then(serde_json::Value::as_u64)
+            .is_none()
         {
-            actual_markdown.insert(file_name.to_owned());
+            return Err(format!(
+                "SOURCES.json {relative:?} version must be an integer"
+            ));
+        }
+        for key in ["source_content_hash", "materialized_sha256"] {
+            let hash = source
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| format!("SOURCES.json {relative:?} field {key} must be a string"))?;
+            if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(format!(
+                    "SOURCES.json {relative:?} field {key} must be a SHA-256 hex string"
+                ));
+            }
         }
     }
-
-    let mut expected_markdown = BTreeSet::new();
-    expected_markdown.insert("README.md".to_owned());
-    for rule in REQUIRED_RULES {
-        expected_markdown.insert(rule.to_owned());
-    }
-
-    if actual_markdown != expected_markdown {
-        let missing = expected_markdown
-            .difference(&actual_markdown)
-            .cloned()
-            .collect::<Vec<_>>();
-        let unexpected = actual_markdown
-            .difference(&expected_markdown)
-            .cloned()
-            .collect::<Vec<_>>();
-        return Err(HarnessError(format!(
-            "Rust rule set mismatch: missing={missing:?}, unexpected={unexpected:?}"
-        ))
-        .into());
-    }
-
-    verify_rule_document(&rules_dir.join("README.md"))?;
-    for rule in REQUIRED_RULES {
-        verify_rule_document(&rules_dir.join(rule))?;
-    }
-
-    for (relative_path, expected_name) in REQUIRED_SKILLS {
-        verify_skill(root, relative_path, expected_name)?;
-    }
-
-    verify_broker_profile(root)?;
-    verify_workspace_policy(root)?;
-    verify_dependency_policy(root)?;
-
-    println!(
-        "rust rules: ok ({} numbered rules, {} mandatory skills)",
-        REQUIRED_RULES.len(),
-        REQUIRED_SKILLS.len()
-    );
     Ok(())
 }
 
-fn verify_rule_document(path: &Path) -> HarnessResult<()> {
-    let content = fs::read_to_string(path)?;
-    if content.len() < 256 {
-        return Err(HarnessError(format!(
-            "rule document is unexpectedly small: {}",
-            path.display()
-        ))
-        .into());
+fn lint_level<'a>(table: &'a toml::value::Table, name: &str) -> Option<&'a str> {
+    match table.get(name)? {
+        toml::Value::String(value) => Some(value),
+        toml::Value::Table(value) => value.get("level").and_then(toml::Value::as_str),
+        _ => None,
     }
-    if !content.starts_with("# ") {
-        return Err(HarnessError(format!(
-            "rule document must start with an H1: {}",
-            path.display()
-        ))
-        .into());
+}
+
+fn verify_cargo_baseline(root: &Path, policy: &HarnessPolicy) -> Result<(), String> {
+    let manifest = read_toml(&root.join("Cargo.toml"))?;
+    verify_cargo_manifest(&manifest, policy)
+}
+
+fn verify_cargo_manifest(manifest: &toml::Value, policy: &HarnessPolicy) -> Result<(), String> {
+    let workspace = required_table(manifest, "workspace")?;
+    if workspace.get("resolver").and_then(toml::Value::as_str) != Some("3") {
+        return Err("workspace.resolver must be \"3\"".to_owned());
     }
-    if !content.contains("\n## ") {
-        return Err(HarnessError(format!(
-            "rule document must contain at least one H2 section: {}",
-            path.display()
-        ))
-        .into());
+    let package = workspace
+        .get("package")
+        .and_then(toml::Value::as_table)
+        .ok_or_else(|| "root Cargo.toml must define [workspace.package]".to_owned())?;
+    if package.get("edition").and_then(toml::Value::as_str) != Some("2024") {
+        return Err("workspace.package.edition must be \"2024\"".to_owned());
+    }
+    let actual_msrv = package
+        .get("rust-version")
+        .and_then(toml::Value::as_str)
+        .ok_or_else(|| "workspace.package.rust-version is required".to_owned())?;
+    if actual_msrv != policy.workspace_msrv {
+        return Err(format!(
+            "workspace MSRV mismatch: HARNESS.toml={:?}, Cargo.toml={actual_msrv:?}",
+            policy.workspace_msrv
+        ));
+    }
+
+    let lints = workspace
+        .get("lints")
+        .and_then(toml::Value::as_table)
+        .ok_or_else(|| "root Cargo.toml must define [workspace.lints]".to_owned())?;
+    let rust = lints
+        .get("rust")
+        .and_then(toml::Value::as_table)
+        .ok_or_else(|| "root Cargo.toml must define [workspace.lints.rust]".to_owned())?;
+    for (lint, expected) in [("warnings", "deny"), ("unsafe_code", "forbid")] {
+        if lint_level(rust, lint) != Some(expected) {
+            return Err(format!("workspace rust lint {lint} must be {expected}"));
+        }
+    }
+    let clippy = lints
+        .get("clippy")
+        .and_then(toml::Value::as_table)
+        .ok_or_else(|| "root Cargo.toml must define [workspace.lints.clippy]".to_owned())?;
+    if lint_level(clippy, "all") != Some("deny") {
+        return Err("workspace Clippy all group must be deny".to_owned());
+    }
+    if lint_level(clippy, "pedantic") != Some("warn") {
+        return Err("workspace Clippy pedantic group must remain warn".to_owned());
     }
     Ok(())
 }
 
-fn verify_skill(root: &Path, relative_path: &str, expected_name: &str) -> HarnessResult<()> {
-    let path = root.join(relative_path);
-    let content = fs::read_to_string(&path)?;
-    if !content.starts_with("---\n") || !content.contains(expected_name) {
-        return Err(HarnessError(format!(
-            "mandatory Rust skill has invalid frontmatter: {}",
-            path.display()
-        ))
-        .into());
+fn verify_removed_packages_absent(root: &Path) -> Result<(), String> {
+    // Retired architectures that must never re-enter the Broker lockfile:
+    // the Python Broker era ended with the Rust `agentbrokerd` cutover.
+    const REMOVED_PACKAGES: &[&str] = &["chattocodex", "agent-broker-py", "pyo3"];
+    let lock = read_toml(&root.join("Cargo.lock"))?;
+    let packages = lock
+        .get("package")
+        .and_then(toml::Value::as_array)
+        .ok_or_else(|| "Cargo.lock must contain package records".to_owned())?;
+    for package in packages {
+        let name = package
+            .get("name")
+            .and_then(toml::Value::as_str)
+            .ok_or_else(|| "Cargo.lock package missing name".to_owned())?;
+        if REMOVED_PACKAGES.contains(&name) {
+            return Err(format!(
+                "removed architecture package remains in Cargo.lock: {name}"
+            ));
+        }
     }
     Ok(())
 }
 
-fn verify_broker_profile(root: &Path) -> HarnessResult<()> {
-    let path = root.join(".agents/rust_dev_rules/BROKER_PROFILE.md");
-    let content = fs::read_to_string(&path)?;
-    let required_references = [
-        ".agents/rust_dev_rules/rules/00-overview.md",
-        ".agents/rust_dev_rules/skills/rust-production-engineering/SKILL.md",
-        ".agents/rust_dev_rules/skills/rust-distributed-broker/SKILL.md",
-    ];
-    for reference in required_references {
-        if !content.contains(reference) {
-            return Err(
-                HarnessError(format!("BROKER_PROFILE.md must reference {reference}")).into(),
+fn cargo_metadata(root: &Path, policy: &ToolchainPolicy) -> Result<serde_json::Value, String> {
+    let mut command = policy.command("cargo");
+    command
+        .args(["metadata", "--locked", "--format-version", "1", "--no-deps"])
+        .current_dir(root);
+    let output = command
+        .output()
+        .map_err(|error| format!("failed to run cargo metadata: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "cargo metadata failed with status {}",
+            output.status
+        ));
+    }
+    serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("cargo metadata returned invalid JSON: {error}"))
+}
+
+fn verify_workspace_members(
+    root: &Path,
+    toolchain: &ToolchainPolicy,
+    policy: &HarnessPolicy,
+) -> Result<(), String> {
+    let metadata = cargo_metadata(root, toolchain)?;
+    let packages = metadata
+        .get("packages")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "cargo metadata has no packages array".to_owned())?;
+    let mut public_seen = false;
+    let mut xtask_count = 0_u8;
+    for package in packages {
+        let name = package
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "cargo metadata package missing name".to_owned())?;
+        let manifest_path = package
+            .get("manifest_path")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "cargo metadata package missing manifest_path".to_owned())?;
+        let manifest = read_toml(Path::new(manifest_path))?;
+        if manifest
+            .get("lints")
+            .and_then(toml::Value::as_table)
+            .and_then(|table| table.get("workspace"))
+            .and_then(toml::Value::as_bool)
+            != Some(true)
+        {
+            return Err(format!(
+                "safe workspace member must use [lints] workspace = true: {manifest_path}"
+            ));
+        }
+        if let Some(public_policy) = &policy.public_policy
+            && name == public_policy.crate_name
+        {
+            public_seen = true;
+            let actual = package
+                .get("rust_version")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| format!("public policy crate {name:?} must declare rust-version"))?;
+            verify_public_policy_version(name, actual, public_policy)?;
+        }
+        if name == "xtask" {
+            xtask_count = xtask_count.saturating_add(1);
+            let expected = root.join("xtask/Cargo.toml");
+            if Path::new(manifest_path) != expected {
+                return Err(format!(
+                    "xtask must be owned by {}, found {manifest_path}",
+                    expected.display()
+                ));
+            }
+        }
+    }
+    if let Some(public_policy) = &policy.public_policy
+        && !public_seen
+    {
+        return Err(format!(
+            "public policy crate {:?} is not a workspace member",
+            public_policy.crate_name
+        ));
+    }
+    if xtask_count != 1 {
+        return Err(format!(
+            "workspace must contain exactly one xtask package, found {xtask_count}"
+        ));
+    }
+    Ok(())
+}
+
+fn verify_public_policy_version(
+    name: &str,
+    actual: &str,
+    policy: &PublicPolicy,
+) -> Result<(), String> {
+    if name != policy.crate_name {
+        return Err(format!(
+            "public policy crate mismatch: expected {:?}, found {name:?}",
+            policy.crate_name
+        ));
+    }
+    if actual != policy.msrv {
+        return Err(format!(
+            "public policy MSRV mismatch: HARNESS.toml={:?}, Cargo metadata={actual:?}",
+            policy.msrv
+        ));
+    }
+    Ok(())
+}
+
+fn tool_version(root: &Path, policy: &ToolchainPolicy, program: &str) -> Result<String, String> {
+    let mut command = policy.command(program);
+    command.arg("--version").current_dir(root);
+    output_line(&mut command, &format!("declared {program} --version"))
+}
+
+fn ambient_tool_version(root: &Path, program: &str) -> Result<String, String> {
+    let mut command = Command::new(program);
+    command.arg("--version").current_dir(root);
+    output_line(&mut command, &format!("ambient {program} --version"))
+}
+
+fn output_line(command: &mut Command, label: &str) -> Result<String, String> {
+    let output = command
+        .output()
+        .map_err(|error| format!("failed to execute {label}: {error}"))?;
+    if !output.status.success() {
+        return Err(format!("{label} failed with status {}", output.status));
+    }
+    String::from_utf8(output.stdout)
+        .map(|value| value.trim().to_owned())
+        .map_err(|error| format!("{label} returned non-UTF8 output: {error}"))
+}
+
+fn verify_declared_toolchain_available(
+    root: &Path,
+    policy: &ToolchainPolicy,
+) -> Result<(), String> {
+    let _ = tool_version(root, policy, "rustc")?;
+    let _ = tool_version(root, policy, "cargo")?;
+    Ok(())
+}
+
+fn cargo_command(root: &Path) -> Result<Command, String> {
+    ToolchainPolicy::load(root)?.cargo_family_command("cargo")
+}
+
+fn status(command: &mut Command, label: &str) -> Result<(), String> {
+    let exit = command
+        .status()
+        .map_err(|error| format!("failed to execute {label}: {error}"))?;
+    require_success(exit, label)
+}
+
+fn require_success(exit: ExitStatus, label: &str) -> Result<(), String> {
+    if exit.success() {
+        Ok(())
+    } else {
+        Err(format!("{label} failed with status {exit}"))
+    }
+}
+
+fn fmt() -> Result<(), String> {
+    let root = workspace_root()?;
+    let mut command = ToolchainPolicy::load(&root)?.cargo_family_command("cargo-fmt")?;
+    command
+        .args(["fmt", "--all", "--", "--check"])
+        .current_dir(&root);
+    status(&mut command, "cargo fmt")
+}
+
+fn check() -> Result<(), String> {
+    let root = workspace_root()?;
+    let mut command = cargo_command(&root)?;
+    command.args(CHECK_ARGS).current_dir(&root);
+    status(&mut command, "cargo check")?;
+
+    clippy()
+}
+
+fn clippy() -> Result<(), String> {
+    let root = workspace_root()?;
+    let mut command = ToolchainPolicy::load(&root)?.cargo_family_command("cargo-clippy")?;
+    command.args(CLIPPY_ARGS).current_dir(&root);
+    status(&mut command, "cargo clippy")
+}
+
+fn test() -> Result<(), String> {
+    let root = workspace_root()?;
+    let mut command = cargo_command(&root)?;
+    command.args(TEST_ARGS).current_dir(&root);
+    status(&mut command, "cargo test --all-targets")?;
+
+    let mut command = cargo_command(&root)?;
+    command.args(DOC_TEST_ARGS).current_dir(&root);
+    status(&mut command, "cargo test --doc")
+}
+
+fn msrv() -> Result<(), String> {
+    let root = workspace_root()?;
+    let policy = HarnessPolicy::load(&root)?;
+    let Some(public_policy) = &policy.public_policy else {
+        println!("no public policy crate; workspace MSRV is enforced by the pinned toolchain");
+        return Ok(());
+    };
+    let channel = format!("{}.0", public_policy.msrv);
+    let toolchain = ToolchainPolicy { channel };
+    let mut command = toolchain.cargo_family_command("cargo")?;
+    command
+        .args([
+            "test",
+            "--locked",
+            "-p",
+            &public_policy.crate_name,
+            "--all-targets",
+        ])
+        .current_dir(&root);
+    status(&mut command, "public policy MSRV cargo test --all-targets")?;
+
+    let mut command = toolchain.cargo_family_command("cargo")?;
+    command
+        .args(["test", "--locked", "-p", &public_policy.crate_name, "--doc"])
+        .current_dir(&root);
+    status(&mut command, "public policy MSRV cargo test --doc")
+}
+
+fn ci() -> Result<(), String> {
+    rules()?;
+    fmt()?;
+    check()?;
+    test()
+}
+
+fn deps() -> Result<(), String> {
+    let root = workspace_root()?;
+    require_file(&root.join("deny.toml"))?;
+    let mut command = cargo_command(&root)?;
+    command.args(["deny", "check"]).current_dir(&root);
+    status(&mut command, "cargo deny check")
+}
+
+fn doctor() -> Result<(), String> {
+    let root = workspace_root()?;
+    let policy = ToolchainPolicy::load(&root)?;
+    println!("workspace: {}", root.display());
+    println!("declared toolchain: {}", policy.channel);
+    for program in ["rustc", "cargo"] {
+        let ambient = ambient_tool_version(&root, program)?;
+        let declared = tool_version(&root, &policy, program)?;
+        println!("ambient {program}: {ambient}");
+        println!("declared {program}: {declared}");
+        if declared != ambient {
+            println!(
+                "WARNING: ambient {program} differs; xtask child commands use the declared toolchain"
             );
         }
     }
-    Ok(())
+    rules()
 }
 
-fn verify_workspace_policy(root: &Path) -> HarnessResult<()> {
-    let cargo_toml = fs::read_to_string(root.join("Cargo.toml"))?;
-    let required_fragments = [
-        "resolver = \"3\"",
-        "[workspace.lints.rust]",
-        "unsafe_code = \"forbid\"",
-        "[workspace.lints.clippy]",
-    ];
-    for fragment in required_fragments {
-        if !cargo_toml.contains(fragment) {
-            return Err(HarnessError(format!(
-                "Cargo.toml is missing required Rust policy fragment: {fragment}"
-            ))
-            .into());
-        }
+fn extended() -> Result<(), String> {
+    ci()?;
+    msrv()?;
+    let root = workspace_root()?;
+    if HarnessPolicy::load(&root)?.supply_chain {
+        deps()?;
     }
-    Ok(())
-}
-
-fn verify_dependency_policy(root: &Path) -> HarnessResult<()> {
-    let deny_toml = fs::read_to_string(root.join("deny.toml"))?;
-    for fragment in [
-        "[advisories]",
-        "[licenses]",
-        "[bans]",
-        "wildcards = \"deny\"",
-        "[sources]",
-        "unknown-registry = \"deny\"",
-        "unknown-git = \"deny\"",
-    ] {
-        if !deny_toml.contains(fragment) {
-            return Err(HarnessError(format!(
-                "deny.toml is missing required dependency policy fragment: {fragment}"
-            ))
-            .into());
-        }
-    }
-    Ok(())
-}
-
-fn verify_production_cutover(root: &Path) -> HarnessResult<()> {
-    for retired_path in [
-        "pyproject.toml",
-        "uv.lock",
-        ".python-version",
-        ".agents/MANIFEST.json",
-        ".agents/verify_manifest.py",
-    ] {
-        let path = root.join(retired_path);
-        if path.exists() {
-            return Err(HarnessError(format!(
-                "retired Python Broker artifact reappeared: {}",
-                path.display()
-            ))
-            .into());
-        }
-    }
-
-    for retired_directory in ["src", "tests", "benchmarks"] {
-        let directory = root.join(retired_directory);
-        if directory.exists() && directory_contains_files(&directory)? {
-            return Err(HarnessError(format!(
-                "retired Python Broker directory contains files: {}",
-                directory.display()
-            ))
-            .into());
-        }
-    }
-
-    let runtime_manifest = fs::read_to_string(root.join("crates/agent-broker-runtime/Cargo.toml"))?;
-    if !runtime_manifest.contains("[[bin]]")
-        || !runtime_manifest.contains("name = \"agentbrokerd\"")
-    {
-        return Err(HarnessError(
-            "Rust agent-broker-runtime must own the agentbrokerd binary".to_owned(),
-        )
-        .into());
-    }
-
-    let makefile = fs::read_to_string(root.join("Makefile"))?;
-    if !makefile.contains("process_e2e: rust_process_e2e") {
-        return Err(HarnessError(
-            "Agent Broker Makefile must route generic process_e2e to Rust".to_owned(),
-        )
-        .into());
-    }
-    for required in [
-        "process_e2e: rust_process_e2e",
-        "ci: cutover rust_process_e2e",
-        "cargo test -p agent-broker-runtime --test process_restart_e2e",
-    ] {
-        if !makefile.contains(required) {
-            return Err(HarnessError(format!(
-                "Rust-only Makefile is missing canonical fragment: {required}"
-            ))
-            .into());
-        }
-    }
-    if makefile.contains("reference_")
-        || makefile.contains("PYTHON")
-        || makefile.contains("python")
-        || makefile.contains("uv ")
-    {
-        return Err(HarnessError(
-            "Rust-only Makefile must not retain Python reference execution paths".to_owned(),
-        )
-        .into());
-    }
-
-    verify_python_client_sdk_boundary(root)?;
-
-    println!(
-        "production cutover: ok (Rust Broker authority; retired Python Broker absent; client SDK isolated)"
-    );
-    Ok(())
-}
-
-fn verify_python_client_sdk_boundary(root: &Path) -> HarnessResult<()> {
-    let sdk_manifest_path = root.join("sdks/python/pyproject.toml");
-    let sdk_manifest = fs::read_to_string(&sdk_manifest_path).map_err(|error| {
-        HarnessError(format!(
-            "Python client SDK manifest is required at {}: {error}",
-            sdk_manifest_path.display()
-        ))
-    })?;
-    for fragment in [
-        "name = \"heterarchy-broker-sdk\"",
-        "Typed Python client SDK for the Rust Heterarchy Agent Broker",
-        "dependencies = []",
-        "where = [\"src\"]",
-    ] {
-        if !sdk_manifest.contains(fragment) {
-            return Err(HarnessError(format!(
-                "Python client SDK manifest is missing required client-only fragment: {fragment}"
-            ))
-            .into());
-        }
-    }
-    if sdk_manifest.contains("[project.scripts]") || sdk_manifest.contains("agentbrokerd") {
-        return Err(HarnessError(
-            "Python client SDK must not define Broker executable authority".to_owned(),
-        )
-        .into());
-    }
-
-    let package_root = root.join("sdks/python/src/agent_broker");
-    for required in [
-        "__init__.py",
-        "client.py",
-        "cluster.py",
-        "errors.py",
-        "models.py",
-        "protocol.py",
-        "standalone.py",
-    ] {
-        let path = package_root.join(required);
-        if !path.is_file() {
-            return Err(HarnessError(format!(
-                "Python client SDK is missing required boundary file: {}",
-                path.display()
-            ))
-            .into());
-        }
-    }
-    Ok(())
-}
-
-fn directory_contains_files(directory: &Path) -> HarnessResult<bool> {
-    for entry in fs::read_dir(directory)? {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
-        if file_type.is_file() {
-            return Ok(true);
-        }
-        if file_type.is_dir() && directory_contains_files(&entry.path())? {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-fn run_check(root: &Path) -> HarnessResult<()> {
-    run_cargo(root, "rustfmt", &["fmt", "--all", "--", "--check"])?;
-    run_cargo(
-        root,
-        "cargo check",
-        &["check", "--workspace", "--all-targets"],
-    )?;
-    run_cargo(
-        root,
-        "clippy",
-        &[
-            "clippy",
-            "--workspace",
-            "--all-targets",
-            "--",
-            "-D",
-            "warnings",
-        ],
-    )
-}
-
-fn run_tests(root: &Path) -> HarnessResult<()> {
-    run_cargo(
-        root,
-        "cargo test",
-        &["test", "--workspace", "--all-targets"],
-    )
-}
-
-fn run_ci(root: &Path) -> HarnessResult<()> {
-    verify_rules(root)?;
-    verify_production_cutover(root)?;
-    run_git_hygiene(root)?;
-    run_check(root)?;
-    run_tests(root)
-}
-
-fn run_git_hygiene(root: &Path) -> HarnessResult<()> {
-    let whitespace = Command::new("git")
-        .args(["diff", "--check", "HEAD", "--", "."])
-        .current_dir(root)
-        .status()?;
-    if !whitespace.success() {
-        return Err(
-            HarnessError(format!("git diff --check failed with status {whitespace}")).into(),
-        );
-    }
-
-    let protected = Command::new("git")
+    let mut command = cargo_command(&root)?;
+    command
         .args([
-            "diff",
-            "--quiet",
-            "HEAD",
-            "--",
-            "compatibility",
-            "fuzz/seeds",
+            "--config",
+            "build.rustdocflags=[\"-D\",\"warnings\"]",
+            "doc",
+            "--locked",
+            "--workspace",
+            "--no-deps",
         ])
-        .current_dir(root)
-        .status()?;
-    if protected.success() {
-        let protected_status = Command::new("git")
-            .args([
-                "status",
-                "--porcelain",
-                "--untracked-files=all",
-                "--",
-                "compatibility",
-                "fuzz/seeds",
-            ])
-            .current_dir(root)
-            .output()?;
-        if !protected_status.status.success() {
-            return Err(HarnessError(format!(
-                "protected-tree git status failed with status {}",
-                protected_status.status
-            ))
-            .into());
-        }
-        if protected_status.stdout.is_empty() {
-            return Ok(());
-        }
-        return Err(HarnessError(
-            "frozen compatibility/** or fuzz/seeds/** contains tracked or untracked changes"
-                .to_owned(),
-        )
-        .into());
-    }
-    if protected.code() == Some(1) {
-        return Err(HarnessError(
-            "frozen compatibility/** or fuzz/seeds/** changed relative to HEAD".to_owned(),
-        )
-        .into());
-    }
-    Err(HarnessError(format!(
-        "protected-tree git diff failed with status {protected}"
-    ))
-    .into())
+        .current_dir(&root);
+    status(&mut command, "cargo doc")
 }
 
-fn run_cutover_checks(root: &Path) -> HarnessResult<()> {
-    run_ci(root)?;
-    run_performance_checks(root)
-}
-
-fn run_performance_checks(root: &Path) -> HarnessResult<()> {
-    run_cargo(
-        root,
-        "release snapshot transport RSS budget",
-        &[
-            "test",
-            "--release",
-            "-p",
-            "agent-broker-consensus",
-            "snapshot_binary_transfer_peak_rss_is_bounded",
-            "--",
-            "--ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ],
-    )?;
-    run_cargo(
-        root,
-        "release perf build",
-        &[
-            "build",
-            "--release",
-            "-p",
-            "agent-broker-runtime",
-            "--bin",
-            "agentbrokerd",
-            "--example",
-            "perf_probe",
-        ],
-    )?;
-    run_cargo(
-        root,
-        "release perf probe",
-        &[
-            "run",
-            "--release",
-            "-p",
-            "agent-broker-runtime",
-            "--example",
-            "perf_probe",
-        ],
-    )
-}
-
-fn verify_fuzz_seed_corpus(root: &Path) -> HarnessResult<()> {
-    let mut protocol_expected = verify_line_seed_set(
-        root,
-        "compatibility/wire-v1/request_frames.ndjson",
-        "fuzz/seeds/protocol_v1",
-        "request",
-    )?;
-    protocol_expected.extend(verify_line_seed_set(
-        root,
-        "compatibility/wire-v1/response_frames.ndjson",
-        "fuzz/seeds/protocol_v1",
-        "response",
-    )?);
-    let protocol_actual = regular_file_names(&root.join("fuzz/seeds/protocol_v1"))?;
-    if protocol_actual != protocol_expected {
-        return Err(HarnessError(format!(
-            "protocol fuzz seed set mismatch: expected={protocol_expected:?}, actual={protocol_actual:?}"
-        ))
-        .into());
-    }
-
-    let journal_expected = verify_line_seed_set(
-        root,
-        "compatibility/storage-v1/journal.ndjson",
-        "fuzz/seeds/journal_v1",
-        "mutation",
-    )?;
-    let journal_actual = regular_file_names(&root.join("fuzz/seeds/journal_v1"))?;
-    if journal_actual != journal_expected {
-        return Err(HarnessError(format!(
-            "journal fuzz seed set mismatch: expected={journal_expected:?}, actual={journal_actual:?}"
-        ))
-        .into());
-    }
-
-    let snapshot = fs::read(root.join("compatibility/storage-v1/snapshot.json"))?;
-    let snapshot_seed =
-        fs::read(root.join("fuzz/seeds/snapshot_v1/python-reference-snapshot.json"))?;
-    if snapshot != snapshot_seed {
+fn perf() -> Result<(), String> {
+    let root = workspace_root()?;
+    let policy = ToolchainPolicy::load(&root)?;
+    let metadata = cargo_metadata(&root, &policy)?;
+    if !has_benchmark_target(&metadata) {
         return Err(
-            HarnessError("snapshot fuzz seed drifted from Python corpus".to_owned()).into(),
+            "perf is not configured: Cargo metadata declares no benchmark target".to_owned(),
         );
     }
-    let snapshot_files = regular_file_names(&root.join("fuzz/seeds/snapshot_v1"))?;
-    let expected_snapshot = BTreeSet::from(["python-reference-snapshot.json".to_owned()]);
-    if snapshot_files != expected_snapshot {
-        return Err(HarnessError(format!(
-            "snapshot fuzz seed set mismatch: actual={snapshot_files:?}"
-        ))
-        .into());
-    }
-
-    println!("fuzz seeds: ok (Python executable corpora are byte-aligned)");
-    Ok(())
+    let mut command = policy.command("cargo");
+    command
+        .args(["bench", "--locked", "--workspace"])
+        .current_dir(&root);
+    status(&mut command, "cargo bench")
 }
 
-fn verify_line_seed_set(
-    root: &Path,
-    source_relative: &str,
-    seed_relative: &str,
-    prefix: &str,
-) -> HarnessResult<BTreeSet<String>> {
-    let source = fs::read(root.join(source_relative))?;
-    let frames = source
-        .split_inclusive(|byte| *byte == b'\n')
-        .filter(|frame| !frame.is_empty())
-        .collect::<Vec<_>>();
-    if frames.is_empty() || frames.iter().any(|frame| !frame.ends_with(b"\n")) {
-        return Err(HarnessError(format!(
-            "compatibility corpus must contain newline-framed records: {source_relative}"
-        ))
-        .into());
-    }
-
-    let seed_directory = root.join(seed_relative);
-    let mut expected_files = BTreeSet::new();
-    for (index, frame) in frames.iter().enumerate() {
-        let file_name = format!("{prefix}-{:02}.ndjson", index + 1);
-        let seed = fs::read(seed_directory.join(&file_name))?;
-        if seed != *frame {
-            return Err(HarnessError(format!(
-                "fuzz seed drifted from compatibility corpus: {seed_relative}/{file_name}"
-            ))
-            .into());
-        }
-        expected_files.insert(file_name);
-    }
-    Ok(expected_files)
+fn has_benchmark_target(metadata: &serde_json::Value) -> bool {
+    metadata
+        .get("packages")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|package| package.get("targets").and_then(serde_json::Value::as_array))
+        .flatten()
+        .filter_map(|target| target.get("kind").and_then(serde_json::Value::as_array))
+        .flatten()
+        .any(|kind| kind.as_str() == Some("bench"))
 }
 
-fn regular_file_names(directory: &Path) -> HarnessResult<BTreeSet<String>> {
-    let mut names = BTreeSet::new();
-    for entry in fs::read_dir(directory)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_file() {
-            continue;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(label: &str) -> Result<Self, String> {
+            let serial = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "orchestration-xtask-{label}-{}-{serial}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&path)
+                .map_err(|error| format!("failed to create {}: {error}", path.display()))?;
+            Ok(Self(path))
         }
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-            return Err(HarnessError(format!(
-                "fuzz seed filename is not valid UTF-8: {}",
-                entry.path().display()
-            ))
-            .into());
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn write(path: &Path, content: &str) -> Result<(), String> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
+        }
+        fs::write(path, content)
+            .map_err(|error| format!("failed to write {}: {error}", path.display()))
+    }
+
+    fn command_parts(command: &Command) -> Vec<String> {
+        std::iter::once(command.get_program())
+            .chain(command.get_args())
+            .map(|part| part.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn declared_toolchain_pins_child_argv() {
+        let policy = ToolchainPolicy {
+            channel: "1.98.0".to_owned(),
         };
-        names.insert(name);
+        assert_eq!(
+            command_parts(&policy.command("cargo")),
+            ["rustup", "run", "1.98.0", "cargo"]
+        );
     }
-    Ok(names)
-}
 
-fn run_extended_checks(root: &Path) -> HarnessResult<()> {
-    verify_fuzz_seed_corpus(root)?;
-    run_cargo(
-        root,
-        "fuzz rustfmt",
-        &[
-            "fmt",
-            "--manifest-path",
-            "fuzz/Cargo.toml",
-            "--all",
-            "--",
-            "--check",
-        ],
-    )?;
-    run_nightly_cargo(root, "fuzz build", &["fuzz", "build"])?;
-    for target in ["protocol_v1", "snapshot_v1", "journal_v1"] {
-        let mutable_corpus = prepare_fuzz_runtime_corpus(root, target)?;
-        run_nightly_cargo(
-            root,
-            "fuzz smoke",
-            &[
-                "fuzz",
-                "run",
-                target,
-                mutable_corpus.as_str(),
-                "--",
-                "-max_total_time=2",
-            ],
+    #[test]
+    fn strict_command_parser_rejects_unknown_and_extra_arguments() {
+        assert_eq!(
+            parse_command(std::iter::empty::<&str>()),
+            Ok(XtaskCommand::Help)
+        );
+        assert_eq!(parse_command(["check"]), Ok(XtaskCommand::Check));
+        assert_eq!(parse_command(["clippy"]), Ok(XtaskCommand::Clippy));
+        assert!(parse_command(["check", "extra"]).is_err());
+    }
+
+    #[test]
+    fn workspace_discovery_is_independent_of_process_cwd() -> Result<(), String> {
+        let temp = TempDir::new("workspace-root")?;
+        write(
+            &temp.path().join("Cargo.toml"),
+            "[workspace]\nresolver = \"3\"\n",
         )?;
+        let nested = temp
+            .path()
+            .join(".agents/rust_dev_harness/harness/xtask/src");
+        fs::create_dir_all(&nested)
+            .map_err(|error| format!("failed to create {}: {error}", nested.display()))?;
+        let expected = temp
+            .path()
+            .canonicalize()
+            .map_err(|error| format!("failed to canonicalize test workspace: {error}"))?;
+        assert_eq!(find_workspace_root(&nested)?, expected);
+        Ok(())
     }
-    let v3_corpus = prepare_empty_fuzz_runtime_corpus(root, "protocol_v3")?;
-    run_nightly_cargo(
-        root,
-        "fuzz smoke",
-        &[
-            "fuzz",
-            "run",
-            "protocol_v3",
-            v3_corpus.as_str(),
-            "--",
-            "-max_total_time=2",
-        ],
-    )?;
-    verify_fuzz_seed_corpus(root)?;
-    println!("fuzz seeds: immutable after cargo-fuzz smoke runs");
-    Ok(())
-}
 
-fn prepare_fuzz_runtime_corpus(root: &Path, target: &str) -> HarnessResult<String> {
-    let seed_directory = root.join("fuzz/seeds").join(target);
-    let corpus_directory = root.join("fuzz/corpus").join(target);
-    fs::create_dir_all(&corpus_directory)?;
-
-    for entry in fs::read_dir(&seed_directory)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_file() {
-            continue;
+    #[test]
+    fn runtime_manifest_dir_wins_when_a_cached_binary_runs_from_another_copy() -> Result<(), String>
+    {
+        let first = TempDir::new("cached-binary-first")?;
+        let second = TempDir::new("cached-binary-second")?;
+        for root in [first.path(), second.path()] {
+            write(&root.join("Cargo.toml"), "[workspace]\nresolver = \"3\"\n")?;
         }
-        fs::copy(entry.path(), corpus_directory.join(entry.file_name()))?;
-    }
-
-    Ok(corpus_directory.to_string_lossy().into_owned())
-}
-
-fn prepare_empty_fuzz_runtime_corpus(root: &Path, target: &str) -> HarnessResult<String> {
-    let corpus_directory = root.join("fuzz/corpus").join(target);
-    fs::create_dir_all(&corpus_directory)?;
-    Ok(corpus_directory.to_string_lossy().into_owned())
-}
-
-fn run_doctor(root: &Path) -> HarnessResult<()> {
-    println!("workspace: {}", root.display());
-    print_tool_version(root, "rustc", &["--version"])?;
-    print_tool_version(root, "cargo", &["--version"])?;
-    print_optional_cargo_subcommand(root, "fuzz")?;
-    print_optional_cargo_subcommand(root, "deny")?;
-    print_optional_cargo_subcommand(root, "nextest")?;
-    print_optional_program(root, "rustup", &["--version"]);
-    print_optional_rustup_toolchain(root, "nightly");
-    Ok(())
-}
-
-fn run_dependency_checks(root: &Path) -> HarnessResult<()> {
-    verify_dependency_policy(root)?;
-    if !cargo_subcommand_available(root, "deny")? {
-        return Err(HarnessError(
-            "cargo-deny is not installed; install it explicitly before running `cargo xtask deps`"
-                .to_owned(),
-        )
-        .into());
-    }
-    run_cargo(root, "cargo-deny", &["deny", "check"])
-}
-
-fn run_nightly_cargo(root: &Path, label: &str, cargo_args: &[&str]) -> HarnessResult<()> {
-    println!("==> {label} (nightly)");
-    let home = env::var_os("HOME")
-        .ok_or_else(|| HarnessError("HOME is unavailable for the rustup proxy path".to_owned()))?;
-    let proxy_dir = PathBuf::from(home).join(".cargo/bin");
-    let cargo_proxy = proxy_dir.join("cargo");
-    let rustc_proxy = proxy_dir.join("rustc");
-    if !cargo_proxy.is_file() || !rustc_proxy.is_file() {
-        return Err(HarnessError(format!(
-            "rustup cargo/rustc proxies are missing under {}",
-            proxy_dir.display()
-        ))
-        .into());
-    }
-
-    let current_path = env::var_os("PATH").unwrap_or_default();
-    let mut search_path = vec![proxy_dir];
-    search_path.extend(env::split_paths(&current_path));
-    let nightly_path = env::join_paths(search_path)?;
-
-    let status = Command::new(&cargo_proxy)
-        .args(cargo_args)
-        .current_dir(root)
-        .env("PATH", nightly_path)
-        .env("RUSTUP_TOOLCHAIN", "nightly")
-        .env("RUSTUP_AUTO_INSTALL", "0")
-        .status()
-        .map_err(|error| {
-            HarnessError(format!(
-                "nightly fuzz tooling is unavailable through the rustup proxy: {error}"
-            ))
+        let selected_manifest_dir = second.path().join(".agents/rust_dev_harness/harness/xtask");
+        fs::create_dir_all(&selected_manifest_dir).map_err(|error| {
+            format!(
+                "failed to create selected manifest directory {}: {error}",
+                selected_manifest_dir.display()
+            )
         })?;
-    if status.success() {
-        return Ok(());
+        let resolved = workspace_root_from(Some(selected_manifest_dir.as_os_str()), first.path())?;
+        let expected = second
+            .path()
+            .canonicalize()
+            .map_err(|error| format!("failed to canonicalize selected workspace: {error}"))?;
+        assert_eq!(resolved, expected);
+        Ok(())
     }
-    Err(HarnessError(format!(
-        "{label} failed under the explicit nightly toolchain with status {status}"
-    ))
-    .into())
-}
 
-fn run_cargo(root: &Path, label: &str, args: &[&str]) -> HarnessResult<()> {
-    println!("==> {label}");
-    let status = Command::new("cargo")
-        .args(args)
-        .current_dir(root)
-        .status()?;
-    if status.success() {
-        return Ok(());
+    #[test]
+    fn malformed_and_duplicate_toml_fields_fail() -> Result<(), String> {
+        let temp = TempDir::new("invalid-toml")?;
+        let path = temp.path().join("Cargo.toml");
+        write(&path, "[workspace]\nresolver = \"3\"\nresolver = \"2\"\n")?;
+        assert!(read_toml(&path).is_err());
+        write(&path, "[workspace\nresolver = \"3\"\n")?;
+        assert!(read_toml(&path).is_err());
+        Ok(())
     }
-    Err(HarnessError(format!("{label} failed with status {status}")).into())
-}
 
-fn print_tool_version(root: &Path, program: &str, args: &[&str]) -> HarnessResult<()> {
-    let output = Command::new(program)
-        .args(args)
-        .current_dir(root)
-        .output()?;
-    if !output.status.success() {
-        return Err(HarnessError(format!(
-            "{program} version check failed with status {}",
-            output.status
-        ))
-        .into());
+    #[test]
+    fn wrong_section_and_commented_lints_do_not_satisfy_policy() -> Result<(), String> {
+        let policy = HarnessPolicy {
+            workspace_msrv: "1.98".to_owned(),
+            public_policy: Some(PublicPolicy {
+                crate_name: "agent-broker-protocol".to_owned(),
+                msrv: "1.92".to_owned(),
+            }),
+            supply_chain: false,
+        };
+        let valid: toml::Value = toml::from_str(
+            "[workspace]\nresolver=\"3\"\n[workspace.package]\nedition=\"2024\"\nrust-version=\"1.98\"\n[workspace.lints.rust]\nwarnings=\"deny\"\nunsafe_code=\"forbid\"\n[workspace.lints.clippy]\nall=\"deny\"\npedantic=\"warn\"\n",
+        )
+        .map_err(|error| error.to_string())?;
+        verify_cargo_manifest(&valid, &policy)?;
+
+        let wrong_section: toml::Value = toml::from_str(
+            "[workspace]\nresolver=\"3\"\n[workspace.package]\nedition=\"2024\"\nrust-version=\"1.98\"\n[workspace.lints.rust]\n# warnings=\"deny\"\nunsafe_code=\"forbid\"\n[package.metadata]\nwarnings=\"deny\"\n[workspace.lints.clippy]\nall=\"deny\"\npedantic=\"warn\"\n",
+        )
+        .map_err(|error| error.to_string())?;
+        let error = verify_cargo_manifest(&wrong_section, &policy)
+            .err()
+            .ok_or_else(|| "commented and wrong-section warnings unexpectedly passed".to_owned())?;
+        assert!(error.contains("warnings"));
+        Ok(())
     }
-    let version = String::from_utf8_lossy(&output.stdout);
-    println!("{program}: {}", version.trim());
-    Ok(())
-}
 
-fn print_optional_cargo_subcommand(root: &Path, subcommand: &str) -> HarnessResult<()> {
-    let available = cargo_subcommand_available(root, subcommand)?;
-    println!(
-        "cargo-{subcommand}: {}",
-        if available {
-            "available"
-        } else {
-            "not installed"
+    #[test]
+    fn public_policy_msrv_mismatch_is_rejected() {
+        let policy = PublicPolicy {
+            crate_name: "agent-broker-protocol".to_owned(),
+            msrv: "1.92".to_owned(),
+        };
+        assert!(verify_public_policy_version("agent-broker-protocol", "1.93", &policy).is_err());
+        assert!(verify_public_policy_version("wrong-crate", "1.92", &policy).is_err());
+    }
+
+    #[test]
+    fn verification_argv_keeps_lock_and_cargo_lint_authority() {
+        for args in [CHECK_ARGS, CLIPPY_ARGS, TEST_ARGS, DOC_TEST_ARGS] {
+            assert!(args.contains(&"--locked"));
+            assert!(!args.contains(&"-D"));
+            assert!(!args.contains(&"warnings"));
         }
-    );
-    Ok(())
-}
-
-fn cargo_subcommand_available(root: &Path, subcommand: &str) -> HarnessResult<bool> {
-    let output = Command::new("cargo")
-        .args([subcommand, "--version"])
-        .current_dir(root)
-        .output()?;
-    Ok(output.status.success())
-}
-
-fn print_optional_rustup_toolchain(root: &Path, toolchain: &str) {
-    let output = Command::new("rustup")
-        .args(["run", toolchain, "rustc", "--version"])
-        .current_dir(root)
-        .env("RUSTUP_AUTO_INSTALL", "0")
-        .output();
-    match output {
-        Ok(output) if output.status.success() => {
-            let version = String::from_utf8_lossy(&output.stdout);
-            println!("rustup-{toolchain}: {}", version.trim());
-        }
-        Ok(_) | Err(_) => println!("rustup-{toolchain}: not installed"),
     }
-}
 
-fn print_optional_program(root: &Path, program: &str, args: &[&str]) {
-    match Command::new(program).args(args).current_dir(root).output() {
-        Ok(output) if output.status.success() => {
-            let version = String::from_utf8_lossy(&output.stdout);
-            println!("{program}: {}", version.trim());
-        }
-        Ok(_) | Err(_) => println!("{program}: not installed"),
+    #[test]
+    fn manifest_reference_rejects_wrong_value_and_missing_asset() -> Result<(), String> {
+        let temp = TempDir::new("manifest-ref")?;
+        let mut table = toml::value::Table::new();
+        table.insert(
+            "project_profile".to_owned(),
+            toml::Value::String("wrong.md".to_owned()),
+        );
+        assert!(verify_ref(temp.path(), &table, "project_profile", "PROJECT_PROFILE.md").is_err());
+        table.insert(
+            "project_profile".to_owned(),
+            toml::Value::String("PROJECT_PROFILE.md".to_owned()),
+        );
+        assert!(verify_ref(temp.path(), &table, "project_profile", "PROJECT_PROFILE.md").is_err());
+        write(&temp.path().join("PROJECT_PROFILE.md"), "profile")?;
+        verify_ref(temp.path(), &table, "project_profile", "PROJECT_PROFILE.md")
     }
-}
 
-fn print_help() {
-    println!(
-        "Agent Broker repository tasks:\n\
-         \n\
-         cargo xtask rules   Validate the split Rust rule set and mandatory skills.\n\
-         cargo xtask check   Run rustfmt, cargo check, and strict Clippy.\n\
-         cargo xtask test    Run workspace tests and rustdoc tests.\n\
-         cargo xtask ci      Run rules + production-cutover policy + check + test.\n\
-         cargo xtask cutover Run Rust production CI + release performance gate.\n\
-         cargo xtask extended Verify golden seeds + cargo-fuzz build + bounded smoke fuzzing.\n\
-         cargo xtask perf    Run release-profile Broker performance regression gates.\n\
-         cargo xtask doctor  Report Rust and optional tooling availability.\n\
-         cargo xtask deps    Run cargo-deny when explicitly installed."
-    );
+    #[test]
+    fn benchmark_detection_requires_real_target_kind() {
+        let none = serde_json::json!({"packages":[{"targets":[{"kind":["lib"]}]}]});
+        let bench = serde_json::json!({"packages":[{"targets":[{"kind":["bench"]}]}]});
+        assert!(!has_benchmark_target(&none));
+        assert!(has_benchmark_target(&bench));
+    }
 }

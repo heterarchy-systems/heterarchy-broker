@@ -12,8 +12,17 @@ use agent_broker_domain::results::{
     TaskCompletedResult, TaskLeaseRenewedResult, TaskPublishedResult,
 };
 use agent_broker_domain::{
-    ConsumerGroupId, ConsumerId, Generation, LeaseDurationMs, LeaseEpoch, LeaseId, NamespaceId,
-    TaskId, TaskObjective, TaskResult, Term,
+    AuthorityFenceKey, AuthorityId, AuthorityOwnerId, AuthorityRevision, ConsumerGroupId,
+    ConsumerId, Generation, LeaseDurationMs, LeaseEpoch, LeaseId, NamespaceId, TaskId,
+    TaskObjective, TaskResult, Term,
+};
+use agent_broker_protocol::{
+    AuthorityRecordRequestV3, AuthorityReleaseRequestV3, OwnerAcquisitionRequestV3,
+    OwnerIdentifiedBrokerRequestV3, decode_authority_record_response_with_limit,
+    decode_authority_release_response_with_limit, decode_owner_acquisition_response_with_limit,
+    decode_owner_mutation_response_with_limit, encode_authority_record_request_with_limit,
+    encode_authority_release_request_with_limit, encode_owner_acquisition_request_with_limit,
+    encode_owner_mutation_request_with_limit,
 };
 use agent_broker_protocol::{
     BrokerRequest, ClaimTaskRequest, CompleteTaskRequest, DeclaredCapabilities,
@@ -22,11 +31,6 @@ use agent_broker_protocol::{
     PublishTaskRequest, RenewTaskLeaseRequest, RequestId, ResponseDecodeError, SuccessPayload,
     decode_response_for_operation_with_limit, decode_response_v2_for_operation_with_limit,
     encode_identified_request, encode_request,
-};
-use agent_broker_protocol::{
-    OwnerAcquisitionRequestV3, OwnerIdentifiedBrokerRequestV3,
-    decode_owner_acquisition_response_with_limit, decode_owner_mutation_response_with_limit,
-    encode_owner_acquisition_request_with_limit, encode_owner_mutation_request_with_limit,
 };
 
 use crate::session_store::{DurableClientSessionStore, ReservedCommand};
@@ -351,6 +355,100 @@ impl BrokerClient {
             self.config.max_response_frame_bytes,
         ) {
             Ok(owner_epoch) => Ok(owner_epoch),
+            Err(ResponseDecodeError::Protocol(error)) => Err(ClientError::Protocol(error)),
+            Err(ResponseDecodeError::Broker(error)) => Err(ClientError::Broker(error)),
+        };
+        if matches!(
+            result,
+            Err(ClientError::Transport(_) | ClientError::Protocol(_))
+        ) {
+            self.close();
+        }
+        result
+    }
+
+    /// Record or succeed one generic authority fence through protocol-v3.
+    ///
+    /// `revision` is the caller's exact monotonic record value (arbitrary values >= 1, including
+    /// gaps), not a compare-and-increment counter. `request_id` correlation reproduces the exact
+    /// deterministic transition on replay but is not a dedup guarantee. No automatic retry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] for transport/protocol failures or stable Broker rejection such as
+    /// `CONFLICT` (same authority, different revision), `STALE_FENCE` (superseded), or
+    /// `CAPACITY_EXCEEDED`.
+    pub fn authority_record(
+        &mut self,
+        key: AuthorityFenceKey,
+        revision: AuthorityRevision,
+        authority_id: AuthorityId,
+        owner_instance_id: AuthorityOwnerId,
+    ) -> Result<AuthorityRevision, ClientError> {
+        let request_id = self.next_request_id()?;
+        let request = AuthorityRecordRequestV3::new(
+            request_id.clone(),
+            key,
+            revision,
+            authority_id,
+            owner_instance_id,
+        );
+        let frame = encode_authority_record_request_with_limit(
+            &request,
+            self.config.max_response_frame_bytes,
+        )
+        .map_err(ClientError::Protocol)?;
+        let response = self.round_trip_frame(&frame)?;
+        let result = match decode_authority_record_response_with_limit(
+            &response,
+            &request_id,
+            self.config.max_response_frame_bytes,
+        ) {
+            Ok(revision) => Ok(revision),
+            Err(ResponseDecodeError::Protocol(error)) => Err(ClientError::Protocol(error)),
+            Err(ResponseDecodeError::Broker(error)) => Err(ClientError::Broker(error)),
+        };
+        if matches!(
+            result,
+            Err(ClientError::Transport(_) | ClientError::Protocol(_))
+        ) {
+            self.close();
+        }
+        result
+    }
+
+    /// Release one generic authority fence through protocol-v3, tombstoning the key at its
+    /// recorded revision so later records at or below that floor are fenced (`STALE_FENCE`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] for transport/protocol failures or stable Broker rejection such as
+    /// `NOT_FOUND` or a stale owner/revision fence.
+    pub fn authority_release(
+        &mut self,
+        key: AuthorityFenceKey,
+        expected_revision: AuthorityRevision,
+        owner_instance_id: AuthorityOwnerId,
+    ) -> Result<AuthorityRevision, ClientError> {
+        let request_id = self.next_request_id()?;
+        let request = AuthorityReleaseRequestV3::new(
+            request_id.clone(),
+            key,
+            expected_revision,
+            owner_instance_id,
+        );
+        let frame = encode_authority_release_request_with_limit(
+            &request,
+            self.config.max_response_frame_bytes,
+        )
+        .map_err(ClientError::Protocol)?;
+        let response = self.round_trip_frame(&frame)?;
+        let result = match decode_authority_release_response_with_limit(
+            &response,
+            &request_id,
+            self.config.max_response_frame_bytes,
+        ) {
+            Ok(floor_revision) => Ok(floor_revision),
             Err(ResponseDecodeError::Protocol(error)) => Err(ClientError::Protocol(error)),
             Err(ResponseDecodeError::Broker(error)) => Err(ClientError::Broker(error)),
         };

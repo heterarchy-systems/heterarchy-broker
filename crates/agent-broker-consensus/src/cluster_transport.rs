@@ -65,6 +65,7 @@ pub(crate) struct TcpRaftNetwork {
 impl RaftNetworkFactory<AgentBrokerRaftTypeConfig> for TcpRaftNetworkFactory {
     type Network = TcpRaftNetwork;
 
+    #[allow(clippy::unused_async_trait_impl)]
     async fn new_client(
         &mut self,
         target: AgentBrokerRaftNodeId,

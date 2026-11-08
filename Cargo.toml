@@ -13,7 +13,7 @@ resolver = "3"
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.97"
+rust-version = "1.98"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
@@ -30,6 +30,7 @@ tokio = { version = "1.53.1", default-features = false, features = ["macros", "r
 rcgen = "0.14.8"
 
 [workspace.lints.rust]
+warnings = "deny"
 unsafe_code = "forbid"
 unused_must_use = "deny"
 
