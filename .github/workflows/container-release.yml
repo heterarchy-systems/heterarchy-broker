@@ -1,0 +1,103 @@
+name: Publish private Broker container
+
+on:
+  push:
+    tags:
+      - "container-v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: broker-container-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Validate and publish Broker container
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Rust 1.98
+        uses: dtolnay/rust-toolchain@1.98
+        with:
+          components: rustfmt, clippy
+
+      - name: Verify numeric container tag matches Broker runtime version
+        id: version
+        run: .github/scripts/container_release_version.sh "$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Verify GHCR package is private and version is unused
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          .github/scripts/check_ghcr.sh \
+            ghcr.io/heterarchy-systems/heterarchy-broker \
+            "${{ steps.version.outputs.version }}" prepare
+
+      - name: Run release readiness gates
+        run: make cutover broker_doctor
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          printf '%s' "$GHCR_TOKEN" |
+            docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+
+      - name: Build and publish private multi-architecture image
+        id: image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/heterarchy-systems/heterarchy-broker:${{ steps.version.outputs.version }}
+            ghcr.io/heterarchy-systems/heterarchy-broker:latest
+          labels: |
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          build-args: |
+            VERSION=${{ steps.version.outputs.version }}
+            VCS_REF=${{ github.sha }}
+          provenance: mode=max
+          sbom: true
+
+      - name: Verify private tags and published digest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          image=ghcr.io/heterarchy-systems/heterarchy-broker
+          verified=false
+          for attempt in {1..10}; do
+            if .github/scripts/check_ghcr.sh "$image" "$VERSION" published; then
+              verified=true
+              break
+            fi
+            sleep 3
+          done
+          [[ "$verified" == true ]]
+          docker pull "$image@$IMAGE_DIGEST"
+          .github/scripts/smoke_container.sh "$image@$IMAGE_DIGEST"
+          printf 'Published private image: `%s:%s`\n\nDigest: `%s`\n' \
+            "$image" "$VERSION" "$IMAGE_DIGEST" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Log out of GHCR
+        if: always()
+        run: docker logout ghcr.io

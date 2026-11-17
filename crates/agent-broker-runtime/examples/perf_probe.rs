@@ -438,7 +438,9 @@ fn measure_storage() -> Result<StorageMetrics, Box<dyn Error>> {
 
 fn start_release_daemon() -> Result<ProcessProbe, Box<dyn Error>> {
     let root = workspace_root()?;
-    let executable = root.join("target/release/agentbrokerd");
+    let target_directory =
+        std::env::var_os("CARGO_TARGET_DIR").map_or_else(|| root.join("target"), PathBuf::from);
+    let executable = target_directory.join("release/agentbrokerd");
     if !executable.is_file() {
         return Err(format!("release agentbrokerd is missing: {}", executable.display()).into());
     }

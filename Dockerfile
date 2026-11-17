@@ -21,7 +21,7 @@ ARG VCS_REF=unknown
 
 LABEL org.opencontainers.image.title="Agent Broker" \
       org.opencontainers.image.description="Rust provider-independent work broker runtime" \
-      org.opencontainers.image.source="https://github.com/limhaneul12/heterarchy-broker" \
+      org.opencontainers.image.source="https://github.com/heterarchy-systems/heterarchy-broker" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${VCS_REF}" \
       org.opencontainers.image.licenses="MIT OR Apache-2.0"

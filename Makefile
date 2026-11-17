@@ -38,6 +38,7 @@ rust_process_e2e:
 cutover: broker_ci perf_check
 
 perf_check:
+	cargo build --locked --release -p agent-broker-runtime --bin agentbrokerd
 	cargo test --release -p agent-broker-consensus snapshot_binary_transfer_peak_rss_is_bounded -- --ignored --nocapture --test-threads=1
 	cargo build --release -p agent-broker-runtime --example perf_probe
 	cargo run --release -p agent-broker-runtime --example perf_probe

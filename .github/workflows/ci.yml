@@ -32,6 +32,12 @@ jobs:
           rustc --version
           cargo --version
 
+      - name: Validate container helper syntax
+        run: |
+          for script in .github/scripts/*.sh; do
+            bash -n "$script"
+          done
+
       - name: Run canonical Rust CI
         run: cargo xtask ci
 
@@ -141,3 +147,17 @@ jobs:
           build-args: |
             VERSION=ci-${{ github.sha }}
             VCS_REF=${{ github.sha }}
+
+      - name: Build local image for runtime smoke
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: heterarchy-broker:ci-${{ github.sha }}
+          build-args: |
+            VERSION=ci-${{ github.sha }}
+            VCS_REF=${{ github.sha }}
+
+      - name: Verify local image health
+        run: .github/scripts/smoke_container.sh "heterarchy-broker:ci-${{ github.sha }}"

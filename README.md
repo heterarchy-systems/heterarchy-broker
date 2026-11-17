@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <a href="https://www.rust-lang.org/"><img alt="Rust" src="https://img.shields.io/badge/Rust-1.97-000000?logo=rust&logoColor=white"></a>
+  <a href="https://www.rust-lang.org/"><img alt="Rust" src="https://img.shields.io/badge/Rust-1.98-000000?logo=rust&logoColor=white"></a>
   <a href="https://www.python.org/"><img alt="Python SDK" src="https://img.shields.io/badge/Python%20SDK-3.11%2B-3776AB?logo=python&logoColor=white"></a>
   <a href="https://github.com/heterarchy-systems/heterarchy-broker/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/heterarchy-systems/heterarchy-broker/actions/workflows/ci.yml/badge.svg"></a>
   <img alt="License" src="https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-yellow.svg">
@@ -65,7 +65,7 @@ The goal is not to build another agent framework. The goal is to provide a relia
 
 Requirements:
 
-- Rust 1.97+
+- Rust 1.98+
 
 Start the Broker:
 
@@ -97,6 +97,17 @@ Stop it with:
 
 ```bash
 make docker_down
+```
+
+### Pull the private GHCR release
+
+Container releases use `container-vX.Y.Z` tags and publish numeric version tags plus `latest` to `ghcr.io/heterarchy-systems/heterarchy-broker`. The workflow runs `make cutover broker_doctor` before publication. A numeric tag must match the `agent-broker-runtime` version in Cargo and cannot be overwritten.
+
+Authenticate with a GitHub classic PAT that has `read:packages`, then pull a version:
+
+```bash
+printf '%s' "$GHCR_READ_TOKEN" | docker login ghcr.io --username "$GITHUB_USER" --password-stdin
+docker pull ghcr.io/heterarchy-systems/heterarchy-broker:0.1.0
 ```
 
 ### Run the three-node development cluster
